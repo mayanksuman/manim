@@ -50,6 +50,7 @@ from ..animation.animation import Animation, Wait, prepare_animation
 from ..camera.camera import Camera
 from ..constants import *
 from ..renderer.cairo_renderer import CairoRenderer
+from ..renderer.webgpu.webgpu_renderer import WebGPURenderer
 from ..renderer.opengl_renderer import OpenGLCamera, OpenGLMobject, OpenGLRenderer
 from ..renderer.shader import Object3D
 from ..utils import opengl, space_ops
@@ -169,7 +170,7 @@ class Scene:
 
     def __init__(
         self,
-        renderer: CairoRenderer | OpenGLRenderer | None = None,
+        renderer: CairoRenderer | OpenGLRenderer | WebGPURenderer | None = None,
         camera_class: type[Camera] = Camera,
         always_update_mobjects: bool = False,
         random_seed: int | None = None,
@@ -204,6 +205,10 @@ class Scene:
             self.mouse_drag_point = OpenGLPoint()
             if renderer is None:
                 renderer = OpenGLRenderer()
+
+        elif config.renderer == RendererType.WEBGPU:
+            if renderer is None:
+                renderer = WebGPURenderer()
 
         if renderer is None:
             self.renderer: CairoRenderer | OpenGLRenderer = CairoRenderer(
@@ -470,7 +475,7 @@ class Scene:
                 family_members.extend(mob.get_family())
             return family_members
         else:
-            assert config.renderer == RendererType.CAIRO
+            assert config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}
             return extract_mobject_family_members(
                 self.mobjects,
                 use_z_index=self.renderer.camera.use_z_index,
@@ -505,7 +510,7 @@ class Scene:
             self.remove(*new_meshes)  # type: ignore[arg-type]
             self.meshes += new_meshes
         else:
-            assert config.renderer == RendererType.CAIRO
+            assert config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}
             new_and_foreground_mobjects: list[Mobject] = [
                 *mobjects,  # type: ignore[list-item]
                 *self.foreground_mobjects,
@@ -565,7 +570,7 @@ class Scene:
             )
             return self
         else:
-            assert config.renderer == RendererType.CAIRO
+            assert config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}
             for list_name in "mobjects", "foreground_mobjects":
                 self.restructure_mobjects(mobjects, list_name, False)
             return self
@@ -1331,7 +1336,7 @@ class Scene:
             animation._setup_scene(self)
             animation.begin()
 
-        if config.renderer == RendererType.CAIRO:
+        if config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
             # Paint all non-moving objects onto the screen, so they don't
             # have to be rendered every frame
             (

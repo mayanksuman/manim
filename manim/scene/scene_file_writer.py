@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from av.stream import Stream
 
     from manim.renderer.cairo_renderer import CairoRenderer
+    from manim.renderer.webgpu.webgpu_renderer import WebGPURenderer
     from manim.renderer.opengl_renderer import OpenGLRenderer
     from manim.typing import PixelArray, StrPath
 
@@ -122,7 +123,7 @@ class SceneFileWriter:
 
     def __init__(
         self,
-        renderer: CairoRenderer | OpenGLRenderer,
+        renderer: CairoRenderer | OpenGLRenderer | WebGPURenderer,
         scene_name: str,
         **kwargs: Any,
     ) -> None:
@@ -468,7 +469,7 @@ class SceneFileWriter:
             else:
                 frame = (
                     frame_or_renderer.get_frame()
-                    if config.renderer == RendererType.OPENGL
+                    if config.renderer in (RendererType.OPENGL, RendererType.WEBGPU)
                     else frame_or_renderer
                 )
 
@@ -481,7 +482,7 @@ class SceneFileWriter:
             else:
                 image = (
                     frame_or_renderer.get_image()
-                    if config.renderer == RendererType.OPENGL
+                    if config.renderer in (RendererType.OPENGL, RendererType.WEBGPU)
                     else Image.fromarray(frame_or_renderer)
                 )
             target_dir = self.image_file_path.parent / self.image_file_path.stem

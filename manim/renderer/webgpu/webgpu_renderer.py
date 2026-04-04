@@ -655,11 +655,8 @@ class WebGPURenderer:
         # One camera bind group per frame (projection may change).
         self.camera_bind_group = self._build_camera_bind_group()
 
-        for mobject in scene.mobjects:
-            if isinstance(mobject, VMobject):
-                # render_webgpu_mobject routes each family member to fill/stroke
-                # or the Phong surface pipeline based on shade_in_3d per submobject.
-                render_webgpu_mobject(self, mobject)
+        # Batch render: collect all geometry first, then 1–3 GPU uploads total.
+        render_webgpu_mobject(self, scene.mobjects)
 
         render_pass.end()
         self._device.queue.submit([encoder.finish()])

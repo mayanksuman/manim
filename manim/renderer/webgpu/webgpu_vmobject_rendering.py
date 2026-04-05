@@ -2,15 +2,10 @@
 
 Fill
 ----
-Uses the Loop-Blinn quadratic bezier test for anti-aliased fill boundaries.
-Each cubic bezier curve is first split into 4 sub-cubics via de Casteljau
-subdivision (2 levels), then each sub-cubic is approximated as a quadratic.
-The subdivision reduces the approximation error to negligible levels (<0.01 %).
-Three kinds of triangles are emitted:
-
-  texture_mode = +1  concave bezier region (Loop-Blinn: keep where u²−v ≥ 0)
-  texture_mode = −1  convex  bezier region (Loop-Blinn: keep where u²−v ≤ 0)
-  texture_mode =  0  flat interior (always kept)
+Uses the Slug algorithm (Lengyel 2017) for GPU-side analytical fill coverage.
+Raw quadratic bezier control points are uploaded to a storage buffer; the
+fragment shader computes exact winding-number coverage per pixel with smooth
+sub-pixel anti-aliasing.  No CPU tessellation is required.
 
 Stroke
 ------
@@ -31,12 +26,12 @@ exact painter's-algorithm order.
 
 from __future__ import annotations
 
+import weakref
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from manim.mobject.types.vectorized_mobject import VMobject
-from manim.utils.space_ops import cross2d, earclip_triangulation
 
 if TYPE_CHECKING:
     import wgpu as wgpu_t
@@ -73,42 +68,6 @@ SURFACE_VERTEX_LAYOUT: dict = {
         {"format": "float32x3", "offset": _SURFACE_OFFSETS["in_vert"],   "shader_location": 0},
         {"format": "float32x3", "offset": _SURFACE_OFFSETS["in_normal"], "shader_location": 1},
         {"format": "float32x4", "offset": _SURFACE_OFFSETS["in_color"],  "shader_location": 2},
-    ],
-}
-
-
-# ---------------------------------------------------------------------------
-# Fill vertex layout — must match vmobject_fill.wgsl locations:
-#   location 0 → in_vert        float32x3  offset  0  (12 bytes)
-#   location 1 → in_color       float32x4  offset 12  (16 bytes)
-#   location 2 → texture_coords float32x2  offset 28  ( 8 bytes)
-#   location 3 → texture_mode   float32    offset 36  ( 4 bytes)
-#   stride: 40 bytes
-# ---------------------------------------------------------------------------
-
-_FILL_DTYPE = np.dtype(
-    [
-        ("in_vert", np.float32, (3,)),
-        ("in_color", np.float32, (4,)),
-        ("texture_coords", np.float32, (2,)),
-        ("texture_mode", np.float32),
-    ]
-)
-_FILL_STRIDE: int = _FILL_DTYPE.itemsize  # 40 bytes
-
-_FILL_OFFSETS: dict[str, int] = {
-    name: _FILL_DTYPE.fields[name][1]  # type: ignore[index]
-    for name in _FILL_DTYPE.names
-}
-
-FILL_VERTEX_LAYOUT: dict = {
-    "array_stride": _FILL_STRIDE,
-    "step_mode": "vertex",
-    "attributes": [
-        {"format": "float32x3", "offset": _FILL_OFFSETS["in_vert"],        "shader_location": 0},
-        {"format": "float32x4", "offset": _FILL_OFFSETS["in_color"],       "shader_location": 1},
-        {"format": "float32x2", "offset": _FILL_OFFSETS["texture_coords"], "shader_location": 2},
-        {"format": "float32",   "offset": _FILL_OFFSETS["texture_mode"],   "shader_location": 3},
     ],
 }
 
@@ -158,6 +117,65 @@ STROKE_VERTEX_LAYOUT: dict = {
 
 
 # ---------------------------------------------------------------------------
+# Slug fill vertex layout — must match slug_fill.wgsl locations:
+#   location 0 → in_pos       float32x2  offset  0  ( 8 bytes)
+#   location 1 → in_color     float32x4  offset  8  (16 bytes)
+#   location 2 → curve_start  uint32     offset 24  ( 4 bytes)
+#   location 3 → n_curves     uint32     offset 28  ( 4 bytes)
+#   stride: 32 bytes
+# ---------------------------------------------------------------------------
+
+_SLUG_FILL_DTYPE = np.dtype(
+    [
+        ("in_pos",      np.float32, (2,)),
+        ("in_color",    np.float32, (4,)),
+        ("curve_start", np.uint32),
+        ("n_curves",    np.uint32),
+    ]
+)
+_SLUG_FILL_STRIDE: int = _SLUG_FILL_DTYPE.itemsize  # 32 bytes
+
+_SLUG_FILL_OFFSETS: dict[str, int] = {
+    name: _SLUG_FILL_DTYPE.fields[name][1]  # type: ignore[index]
+    for name in _SLUG_FILL_DTYPE.names
+}
+
+SLUG_FILL_VERTEX_LAYOUT: dict = {
+    "array_stride": _SLUG_FILL_STRIDE,
+    "step_mode": "vertex",
+    "attributes": [
+        {"format": "float32x2", "offset": _SLUG_FILL_OFFSETS["in_pos"],      "shader_location": 0},
+        {"format": "float32x4", "offset": _SLUG_FILL_OFFSETS["in_color"],    "shader_location": 1},
+        {"format": "uint32",    "offset": _SLUG_FILL_OFFSETS["curve_start"], "shader_location": 2},
+        {"format": "uint32",    "offset": _SLUG_FILL_OFFSETS["n_curves"],    "shader_location": 3},
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Geometry caches — eliminates repeated tessellation for static shapes.
+#
+# Both caches are WeakKeyDictionary so GC can reclaim vmobjects that have
+# been removed from the scene.  Each entry maps:
+#   vmobject → (points_hash: int, geometry: ndarray | tuple[ndarray, ndarray])
+#
+# The points_hash is recomputed cheaply (tobytes hash) every frame; a mismatch
+# means the shape changed and we re-tessellate.
+# ---------------------------------------------------------------------------
+
+_slug_fill_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_stroke_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _points_hash(vmobject: VMobject) -> int:
+    """Fast hash of vmobject.points — used to detect geometry changes."""
+    pts = vmobject.points
+    if pts.size == 0:
+        return 0
+    return hash(pts.tobytes())
+
+
+# ---------------------------------------------------------------------------
 # Public entry point — batched rendering
 # ---------------------------------------------------------------------------
 
@@ -168,34 +186,42 @@ def render_webgpu_mobject(
 ) -> None:
     """Batch-render all VMobjects in *mobjects* (the scene's top-level list).
 
-    Three phases:
+    Four phases:
 
     1. **Tessellate** — iterate every family member of every mobject and
-       collect fill / stroke / surface geometry into plain numpy arrays.
-       No GPU calls are made in this phase.
+       collect geometry into plain numpy arrays.  No GPU calls are made.
 
-    2. **Batch upload** — concatenate all fill arrays into one bytes blob and
-       upload as a single ``VERTEX`` buffer; same for stroke and surface.
-       This yields at most 3 ``create_buffer_with_data`` calls per frame
-       regardless of how many mobjects are in the scene.
+    2. **Batch upload** — at most 4 ``create_buffer_with_data`` calls total:
 
-    3. **Draw** — issue draw commands in scene order, pointing each command at
-       the correct byte-offset within the shared buffer.  The pipeline is only
-       switched when the type changes (fill → stroke → surface), so
-       ``set_pipeline`` / ``set_bind_group`` calls are minimised too.
+       * Slug fill quad vertex buffer  (one bounding quad per shape)
+       * Slug fill curves storage buffer  (all quadratic bezier data)
+       * Stroke vertex buffer
+       * Surface vertex buffer
 
-    Painter's-algorithm order is fully preserved: each submobject's fill draw
-    command comes before its stroke draw command, and mobjects are processed in
-    the same order as ``scene.mobjects``.
+    3. **Build bind groups** — one per pipeline type.  The Slug pipeline
+       gets a bind group that includes both the camera uniform buffer and
+       the curves storage buffer.
+
+    4. **Draw** — draw commands in scene order.  Pipeline switches only happen
+       when the type changes, minimising state-change overhead.
+
+    Fill rendering uses the Slug algorithm (exact winding-number coverage,
+    analytical anti-aliasing, no CPU tessellation).  Stroke uses the existing
+    cubic-SDF Newton-method shader.  3-D surfaces use the Phong shader.
+
+    Painter's-algorithm order is fully preserved.
     """
     import wgpu  # local import so module loads without wgpu installed
 
     # ── Phase 1: tessellate ───────────────────────────────────────────────
-    fill_parts:    list[np.ndarray] = []
+    # Slug fill: one bounding-quad vertex record (6 verts) + flat curve array per shape.
+    slug_quad_parts:   list[np.ndarray] = []   # _SLUG_FILL_DTYPE, 6 verts each
+    slug_curve_parts:  list[np.ndarray] = []   # float32 (N*3, 2) each
+
     stroke_parts:  list[np.ndarray] = []
     surface_parts: list[np.ndarray] = []
 
-    # draw_plan entry: ("fill" | "stroke" | "surface",  index into *_parts list)
+    # draw_plan entry: ("slug_fill" | "stroke" | "surface", index into *_parts)
     draw_plan: list[tuple[str, int]] = []
 
     for mob in mobjects:
@@ -208,31 +234,75 @@ def render_webgpu_mobject(
                     draw_plan.append(("surface", len(surface_parts)))
                     surface_parts.append(data)
             else:
-                fill_data = _collect_fill_geometry(submob)
-                if fill_data is not None:
-                    draw_plan.append(("fill", len(fill_parts)))
-                    fill_parts.append(fill_data)
-                stroke_data = _collect_stroke_geometry(submob)
-                if stroke_data is not None:
+                phash = _points_hash(submob)
+
+                # ── Slug fill (cached) ──────────────────────────────────────
+                cached = _slug_fill_cache.get(submob)
+                if cached is not None and cached[0] == phash:
+                    quad_verts, curves_flat = cached[1]
+                    # quad_verts["curve_start"] will be patched in-place below;
+                    # we must copy so the cached array stays at offset 0.
+                    draw_plan.append(("slug_fill", len(slug_quad_parts)))
+                    slug_quad_parts.append(quad_verts.copy())
+                    slug_curve_parts.append(curves_flat)
+                else:
+                    slug_data = _collect_slug_fill_geometry(submob)
+                    if slug_data is not None:
+                        _slug_fill_cache[submob] = (phash, slug_data)
+                        quad_verts, curves_flat = slug_data
+                        draw_plan.append(("slug_fill", len(slug_quad_parts)))
+                        slug_quad_parts.append(quad_verts.copy())
+                        slug_curve_parts.append(curves_flat)
+
+                # ── Stroke (cached) ─────────────────────────────────────────
+                scached = _stroke_cache.get(submob)
+                if scached is not None and scached[0] == phash:
                     draw_plan.append(("stroke", len(stroke_parts)))
-                    stroke_parts.append(stroke_data)
+                    stroke_parts.append(scached[1])
+                else:
+                    stroke_data = _collect_stroke_geometry(submob)
+                    if stroke_data is not None:
+                        _stroke_cache[submob] = (phash, stroke_data)
+                        draw_plan.append(("stroke", len(stroke_parts)))
+                        stroke_parts.append(stroke_data)
 
     if not draw_plan:
         return
 
-    # ── Phase 2: batch upload — 1 buffer per pipeline type ───────────────
+    # ── Phase 2: batch upload ─────────────────────────────────────────────
     device: wgpu_t.GPUDevice = renderer.device
 
-    fill_buf = fill_byte_offsets = None
+    slug_fill_vbo = slug_fill_byte_offsets = None
+    slug_bind_group = None
     stroke_buf = stroke_byte_offsets = None
     surface_buf = surface_byte_offsets = None
 
-    if fill_parts:
-        fill_buf, fill_byte_offsets = _batch_upload(device, fill_parts)
-        renderer.frame_vbos.append(fill_buf)
+    if slug_quad_parts:
+        # Fix up per-shape curve_start offsets into the shared curves buffer.
+        curve_global_offset = 0
+        for i, curves_flat in enumerate(slug_curve_parts):
+            # curves_flat has shape (n_quads * 3, 2); each curve = 3 entries.
+            n_quads_i = len(curves_flat) // 3
+            slug_quad_parts[i]["curve_start"] = curve_global_offset
+            curve_global_offset += n_quads_i
+
+        slug_fill_vbo, slug_fill_byte_offsets = _batch_upload(device, slug_quad_parts)
+        renderer.frame_vbos.append(slug_fill_vbo)
+
+        all_curves = np.concatenate(slug_curve_parts, axis=0)  # (total * 3, 2)
+        slug_curves_buf = device.create_buffer_with_data(
+            data=all_curves.tobytes(),
+            usage=wgpu.BufferUsage.STORAGE,
+        )
+        renderer.frame_vbos.append(slug_curves_buf)
+
+        # Bind group for Slug pipeline: camera uniform + curves storage.
+        slug_bind_group = renderer._build_slug_bind_group(slug_curves_buf)
+
     if stroke_parts:
         stroke_buf, stroke_byte_offsets = _batch_upload(device, stroke_parts)
         renderer.frame_vbos.append(stroke_buf)
+
     if surface_parts:
         surface_buf, surface_byte_offsets = _batch_upload(device, surface_parts)
         renderer.frame_vbos.append(surface_buf)
@@ -242,20 +312,21 @@ def render_webgpu_mobject(
     current_pipeline: str | None = None
 
     for cmd_type, idx in draw_plan:
-        # Switch pipeline only when the type changes.
         if cmd_type != current_pipeline:
-            if cmd_type == "fill":
-                rp.set_pipeline(renderer.fill_pipeline)
+            if cmd_type == "slug_fill":
+                rp.set_pipeline(renderer.slug_fill_pipeline)
+                rp.set_bind_group(0, slug_bind_group, [], 0, 0)
             elif cmd_type == "stroke":
                 rp.set_pipeline(renderer.stroke_pipeline)
-            else:
+                rp.set_bind_group(0, renderer.camera_bind_group, [], 0, 0)
+            else:  # surface
                 rp.set_pipeline(renderer.surface_pipeline)
-            rp.set_bind_group(0, renderer.camera_bind_group, [], 0, 0)
+                rp.set_bind_group(0, renderer.camera_bind_group, [], 0, 0)
             current_pipeline = cmd_type
 
-        if cmd_type == "fill":
-            arr = fill_parts[idx]
-            rp.set_vertex_buffer(0, fill_buf, fill_byte_offsets[idx], arr.nbytes)
+        if cmd_type == "slug_fill":
+            arr = slug_quad_parts[idx]
+            rp.set_vertex_buffer(0, slug_fill_vbo, slug_fill_byte_offsets[idx], arr.nbytes)
             rp.draw(len(arr), 1, 0, 0)
         elif cmd_type == "stroke":
             arr = stroke_parts[idx]
@@ -280,15 +351,6 @@ def render_webgpu_surface(
     for submob in mobject.family_members_with_points():
         if getattr(submob, "shade_in_3d", False):
             _draw_surface_face(renderer, submob)
-
-
-def render_webgpu_vmobject_fill(
-    renderer: WebGPURenderer,
-    mobject: VMobject,
-) -> None:
-    """Record fill draw calls for *mobject* and all its descendants."""
-    for submob in mobject.family_members_with_points():
-        _draw_vmobject_fill(renderer, submob)
 
 
 def render_webgpu_vmobject_stroke(
@@ -335,29 +397,6 @@ def _batch_upload(
 # ---------------------------------------------------------------------------
 # Geometry collectors — CPU only, no GPU calls
 # ---------------------------------------------------------------------------
-
-
-def _collect_fill_geometry(vmobject: VMobject) -> np.ndarray | None:
-    """Return a ``_FILL_DTYPE`` array for *vmobject*'s fill, or ``None``."""
-    fill_rgba = vmobject.get_fill_rgbas()
-    if fill_rgba.shape[0] == 0 or fill_rgba[0, 3] == 0:
-        return None
-
-    color = fill_rgba[0].astype(np.float32)
-    result = _triangulate_cairo_vmobject(vmobject)
-    if result is None:
-        return None
-    verts, tex_coords, tex_modes = result
-    if len(verts) == 0:
-        return None
-
-    n_verts = len(verts)
-    attrs = np.empty(n_verts, dtype=_FILL_DTYPE)
-    attrs["in_vert"]        = verts.astype(np.float32)
-    attrs["in_color"]       = color
-    attrs["texture_coords"] = tex_coords.astype(np.float32)
-    attrs["texture_mode"]   = tex_modes.astype(np.float32)
-    return attrs
 
 
 def _collect_stroke_geometry(vmobject: VMobject) -> np.ndarray | None:
@@ -463,28 +502,86 @@ def _collect_surface_geometry(vmobject: VMobject) -> np.ndarray | None:
 
 
 # ---------------------------------------------------------------------------
-# Single-mobject draw helpers (used by the explicit public helpers above)
+# Slug fill geometry collector
 # ---------------------------------------------------------------------------
 
 
-def _draw_vmobject_fill(renderer: WebGPURenderer, vmobject: VMobject) -> None:
-    data = _collect_fill_geometry(vmobject)
-    if data is None:
-        return
+def _collect_slug_fill_geometry(
+    vmobject: VMobject,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return ``(quad_verts, curves_flat)`` for the Slug fill pipeline, or ``None``.
 
-    import wgpu
+    *quad_verts* is a ``_SLUG_FILL_DTYPE`` array of 6 vertices forming the
+    axis-aligned bounding quad for this shape.  ``curve_start`` is set to 0
+    and must be patched to the global offset by the caller before upload.
 
-    device: wgpu_t.GPUDevice = renderer.device
-    vbo = device.create_buffer_with_data(
-        data=data.tobytes(), usage=wgpu.BufferUsage.VERTEX
+    *curves_flat* is a ``float32`` array of shape ``(n_quads * 3, 2)``
+    containing the world-space XY coordinates of every quadratic bezier
+    control point — three consecutive entries (p1, p2, p3) per curve.
+    """
+    fill_rgba = vmobject.get_fill_rgbas()
+    if fill_rgba.shape[0] == 0 or fill_rgba[0, 3] == 0:
+        return None
+
+    color    = fill_rgba[0].astype(np.float32)
+    subpaths = vmobject.get_subpaths()
+    if not subpaths:
+        return None
+
+    nppcc = vmobject.n_points_per_cubic_curve
+
+    per_subpath: list[np.ndarray] = []  # each: (n, 3, 2)
+
+    for subpath in subpaths:
+        n_curves = len(subpath) // nppcc
+        if n_curves == 0:
+            continue
+        pts = subpath[: n_curves * nppcc]
+
+        b0s = pts[0::nppcc]
+        h0s = pts[1::nppcc]
+        h1s = pts[2::nppcc]
+        b2s = pts[3::nppcc]
+
+        # Subdivide cubics into quadratics (2 de Casteljau levels → 4 per cubic).
+        qb0s, qmids, qb2s = _cubic_to_quadratics(b0s, h0s, h1s, b2s)
+
+        # Stack to (n_quads, 3, 3): [p1, p2, p3] in xyz; keep only xy.
+        curves_xyz = np.stack([qb0s, qmids, qb2s], axis=1)  # (n, 3, 3)
+        per_subpath.append(curves_xyz[:, :, :2].astype(np.float32))  # (n, 3, 2)
+
+    if not per_subpath:
+        return None
+
+    curves_stacked = np.concatenate(per_subpath, axis=0)  # (N_total, 3, 2)
+    n_quads        = len(curves_stacked)
+    curves_flat    = curves_stacked.reshape(-1, 2)         # (N_total * 3, 2)
+
+    # Bounding box of all control points + small AA padding.
+    bbox_min = curves_flat.min(axis=0) - 0.05
+    bbox_max = curves_flat.max(axis=0) + 0.05
+    x0, y0   = bbox_min
+    x1, y1   = bbox_max
+
+    # 6 vertices: two counter-clockwise triangles covering the bounding rect.
+    quad_pos = np.array(
+        [[x0, y0], [x1, y0], [x0, y1],
+         [x1, y0], [x1, y1], [x0, y1]],
+        dtype=np.float32,
     )
-    renderer.frame_vbos.append(vbo)
 
-    rp = renderer.current_render_pass
-    rp.set_pipeline(renderer.fill_pipeline)
-    rp.set_bind_group(0, renderer.camera_bind_group, [], 0, 0)
-    rp.set_vertex_buffer(0, vbo)
-    rp.draw(len(data), 1, 0, 0)
+    quad_verts = np.empty(6, dtype=_SLUG_FILL_DTYPE)
+    quad_verts["in_pos"]      = quad_pos
+    quad_verts["in_color"]    = color   # broadcast
+    quad_verts["curve_start"] = 0       # patched to global offset by caller
+    quad_verts["n_curves"]    = n_quads
+
+    return quad_verts, curves_flat
+
+
+# ---------------------------------------------------------------------------
+# Single-mobject draw helpers (used by the explicit public helpers above)
+# ---------------------------------------------------------------------------
 
 
 def _draw_vmobject_stroke(renderer: WebGPURenderer, vmobject: VMobject) -> None:
@@ -528,7 +625,7 @@ def _draw_surface_face(renderer: WebGPURenderer, vmobject: VMobject) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cubic → quadratic subdivision (used by fill triangulation)
+# Cubic → quadratic subdivision (used by Slug fill geometry collector)
 # ---------------------------------------------------------------------------
 
 _CUBIC_SUBDIVISION_LEVELS: int = 2  # 4 quadratic pieces per cubic bezier
@@ -572,140 +669,3 @@ def _cubic_to_quadratics(
     qmids = (curves[:, 1] + curves[:, 2]) * 0.5  # midpoint of sub-handles
     qb2s  = curves[:, 3]
     return qb0s, qmids, qb2s
-
-
-# ---------------------------------------------------------------------------
-# Fill triangulation: cubic VMobject → Loop-Blinn triangles
-# ---------------------------------------------------------------------------
-
-
-def _triangulate_cairo_vmobject(
-    vmobject: VMobject,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Return (verts, tex_coords, tex_modes) for all fill triangles.
-
-    Converts each cubic bezier to a quadratic approximation, classifies each
-    curve as concave (+1) or convex (−1), emits bezier boundary triangles with
-    Loop-Blinn UVs, and earclip-triangulates the flat interior (tex_mode=0).
-    """
-    subpaths = vmobject.get_subpaths()
-    if not subpaths:
-        return None
-
-    nppcc = vmobject.n_points_per_cubic_curve  # 4
-    atol  = vmobject.tolerance_for_point_equality
-
-    all_verts:      list[np.ndarray] = []
-    all_tex_coords: list[np.ndarray] = []
-    all_tex_modes:  list[np.ndarray] = []
-
-    for subpath in subpaths:
-        n_curves = len(subpath) // nppcc
-        if n_curves == 0:
-            continue
-
-        pts = subpath[: n_curves * nppcc]  # (4n, 3)
-
-        # Cubic control points.
-        b0s_cubic = pts[0::nppcc]     # start anchors   (n, 3)
-        h0s_cubic = pts[1::nppcc]     # handle 0
-        h1s_cubic = pts[2::nppcc]     # handle 1
-        b2s_cubic = pts[3::nppcc]     # end anchors     (n, 3)
-
-        # Subdivide each cubic into 4 quadratic approximations.
-        b0s, b1s, b2s = _cubic_to_quadratics(b0s_cubic, h0s_cubic, h1s_cubic, b2s_cubic)
-        n_curves = len(b0s)  # now 4 × original
-
-        # Build flat (3*n_curves, 3) quadratic representation for the triangulation.
-        quad_pts = np.empty((n_curves * 3, 3), dtype=np.float64)
-        quad_pts[0::3] = b0s
-        quad_pts[1::3] = b1s
-        quad_pts[2::3] = b2s
-
-        # Classify curves.
-        v01s  = b1s - b0s
-        v12s  = b2s - b1s
-        crosses     = cross2d(v01s, v12s)
-        convexities = np.sign(crosses)
-
-        # Orientation from signed area of anchor polygon.
-        ax, ay   = b0s[:, 0], b0s[:, 1]
-        signed_area = float(
-            np.sum(ax * np.roll(ay, -1) - np.roll(ax, -1) * ay)
-        )
-        if signed_area >= 0:
-            concave_parts = convexities > 0
-            convex_parts  = convexities <= 0
-        else:
-            concave_parts = convexities < 0
-            convex_parts  = convexities >= 0
-
-        # ── Bezier boundary triangles ──────────────────────────────────────
-        _UV_TILE = np.array([[0.0, 0.0], [0.5, 0.0], [1.0, 1.0]], dtype=np.float32)
-
-        if np.any(concave_parts):
-            n_c = int(np.sum(concave_parts))
-            tri = np.empty((n_c * 3, 3))
-            tri[0::3] = b0s[concave_parts]
-            tri[1::3] = b1s[concave_parts]
-            tri[2::3] = b2s[concave_parts]
-            all_verts.append(tri)
-            all_tex_coords.append(np.tile(_UV_TILE, (n_c, 1)))
-            all_tex_modes.append(np.ones(n_c * 3, dtype=np.float32))
-
-        if np.any(convex_parts):
-            n_v = int(np.sum(convex_parts))
-            tri = np.empty((n_v * 3, 3))
-            tri[0::3] = b0s[convex_parts]
-            tri[1::3] = b1s[convex_parts]
-            tri[2::3] = b2s[convex_parts]
-            all_verts.append(tri)
-            all_tex_coords.append(np.tile(_UV_TILE, (n_v, 1)))
-            all_tex_modes.append(-np.ones(n_v * 3, dtype=np.float32))
-
-        # ── Flat interior (earclip) ────────────────────────────────────────
-        end_of_loop = np.zeros(n_curves, dtype=bool)
-        if n_curves > 1:
-            end_of_loop[:-1] = (np.abs(b2s[:-1] - b0s[1:]) > atol).any(1)
-        end_of_loop[-1] = True
-
-        idx = np.arange(n_curves)
-        inner_vert_indices = np.hstack(
-            [
-                idx * 3,
-                idx[concave_parts] * 3 + 1,
-                idx[end_of_loop] * 3 + 2,
-            ]
-        )
-        inner_vert_indices.sort()
-
-        rings = (
-            np.arange(1, len(inner_vert_indices) + 1)[inner_vert_indices % 3 == 2]
-        ).tolist()
-
-        inner_verts = quad_pts[inner_vert_indices]  # (M, 3)
-        if len(inner_verts) < 3 or not rings:
-            continue
-
-        tri_indices_raw = earclip_triangulation(inner_verts[:, :2], rings)
-        if not tri_indices_raw:
-            continue
-
-        inner_tri_indices = inner_vert_indices[
-            np.array(tri_indices_raw, dtype=int)
-        ]
-        inner_pts = quad_pts[inner_tri_indices]
-        n_inner   = len(inner_pts)
-
-        all_verts.append(inner_pts)
-        all_tex_coords.append(np.zeros((n_inner, 2), dtype=np.float32))
-        all_tex_modes.append(np.zeros(n_inner, dtype=np.float32))
-
-    if not all_verts:
-        return None
-
-    return (
-        np.concatenate(all_verts,      axis=0),
-        np.concatenate(all_tex_coords, axis=0),
-        np.concatenate(all_tex_modes,  axis=0),
-    )

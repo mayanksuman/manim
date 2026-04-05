@@ -42,7 +42,7 @@ from manim.utils.space_ops import (
 )
 
 from .webgpu_vmobject_rendering import (
-    FILL_VERTEX_LAYOUT,
+    SLUG_FILL_VERTEX_LAYOUT,
     STROKE_VERTEX_LAYOUT,
     SURFACE_VERTEX_LAYOUT,
     render_webgpu_mobject,
@@ -339,13 +339,15 @@ class WebGPURenderer:
         self._depth_texture: wgpu_t.GPUTexture | None = None
         self._depth_texture_view: wgpu_t.GPUTextureView | None = None
         self._proj_bgl: wgpu_t.GPUBindGroupLayout | None = None
-        self._fill_pipeline: wgpu_t.GPURenderPipeline | None = None
+        self._slug_bgl: wgpu_t.GPUBindGroupLayout | None = None
+        self._slug_fill_pipeline: wgpu_t.GPURenderPipeline | None = None
         self._stroke_pipeline: wgpu_t.GPURenderPipeline | None = None
         self._surface_pipeline: wgpu_t.GPURenderPipeline | None = None
 
         # Per-frame state (set during update_frame, cleared after submit).
         self.current_render_pass: wgpu_t.GPURenderPassEncoder | None = None
         self.camera_bind_group: wgpu_t.GPUBindGroup | None = None
+        self._camera_uniform_buf: wgpu_t.GPUBuffer | None = None
         self.frame_vbos: list[wgpu_t.GPUBuffer] = []
 
     # ------------------------------------------------------------------
@@ -386,25 +388,23 @@ class WebGPURenderer:
         )
         self._depth_texture_view = self._depth_texture.create_view()
 
-        self._proj_bgl, self._fill_pipeline = self._create_fill_pipeline()
+        self._proj_bgl = self._create_camera_bgl()
         self._stroke_pipeline = self._create_stroke_pipeline(self._proj_bgl)
         self._surface_pipeline = self._create_surface_pipeline(self._proj_bgl)
+        self._slug_bgl, self._slug_fill_pipeline = self._create_slug_fill_pipeline()
 
     # ------------------------------------------------------------------
     # Pipeline creation
     # ------------------------------------------------------------------
 
-    def _create_fill_pipeline(
-        self,
-    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
-        assert self._device is not None
-        shader_path = Path(__file__).parent / "shaders" / "vmobject_fill.wgsl"
-        shader_module = self._device.create_shader_module(
-            code=shader_path.read_text(encoding="utf-8")
-        )
+    def _create_camera_bgl(self) -> wgpu_t.GPUBindGroupLayout:
+        """Create the bind group layout shared by stroke, surface, and Slug pipelines.
 
-        # One uniform buffer: projection (64 B) + view (64 B) + light_pos+pad (16 B) = 144 bytes.
-        proj_bgl = self._device.create_bind_group_layout(
+        Layout: binding 0 — one uniform buffer carrying projection (64 B) +
+        view (64 B) + light_pos+pad (16 B) = 144 bytes total.
+        """
+        assert self._device is not None
+        return self._device.create_bind_group_layout(
             entries=[
                 {
                     "binding": 0,
@@ -413,54 +413,6 @@ class WebGPURenderer:
                 }
             ]
         )
-
-        pipeline = self._device.create_render_pipeline(
-            layout=self._device.create_pipeline_layout(
-                bind_group_layouts=[proj_bgl]
-            ),
-            vertex={
-                "module": shader_module,
-                "entry_point": "vs_main",
-                "buffers": [FILL_VERTEX_LAYOUT],
-            },
-            fragment={
-                "module": shader_module,
-                "entry_point": "fs_main",
-                "targets": [
-                    {
-                        "format": wgpu.TextureFormat.rgba8unorm,
-                        "blend": {
-                            "color": {
-                                "src_factor": "src-alpha",
-                                "dst_factor": "one-minus-src-alpha",
-                                "operation": "add",
-                            },
-                            "alpha": {
-                                "src_factor": "one",
-                                "dst_factor": "one",
-                                "operation": "add",
-                            },
-                        },
-                    }
-                ],
-            },
-            primitive={"topology": "triangle-list", "cull_mode": "none"},
-            depth_stencil={
-                "format": wgpu.TextureFormat.depth24plus,
-                "depth_write_enabled": False,
-                "depth_compare": "always",
-                "stencil_front": {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
-                "stencil_back":  {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
-                "stencil_read_mask": 0,
-                "stencil_write_mask": 0,
-            },
-            multisample={
-                "count": 1,
-                "mask": 0xFFFF_FFFF,
-                "alpha_to_coverage_enabled": False,
-            },
-        )
-        return proj_bgl, pipeline
 
     def _create_stroke_pipeline(
         self, proj_bgl: wgpu_t.GPUBindGroupLayout
@@ -564,34 +516,118 @@ class WebGPURenderer:
             },
         )
 
+    def _create_slug_fill_pipeline(
+        self,
+    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
+        """Create the Slug fill pipeline with a storage-buffer bind group layout."""
+        assert self._device is not None
+        shader_path = Path(__file__).parent / "shaders" / "slug_fill.wgsl"
+        shader_module = self._device.create_shader_module(
+            code=shader_path.read_text(encoding="utf-8")
+        )
+
+        # Group 0: binding 0 = camera uniform, binding 1 = curves storage (read-only).
+        slug_bgl = self._device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "read-only-storage", "has_dynamic_offset": False},
+                },
+            ]
+        )
+
+        _blend = {
+            "color": {
+                "src_factor": "src-alpha",
+                "dst_factor": "one-minus-src-alpha",
+                "operation": "add",
+            },
+            "alpha": {
+                "src_factor": "one",
+                "dst_factor": "one",
+                "operation": "add",
+            },
+        }
+
+        pipeline = self._device.create_render_pipeline(
+            layout=self._device.create_pipeline_layout(bind_group_layouts=[slug_bgl]),
+            vertex={
+                "module": shader_module,
+                "entry_point": "vs_main",
+                "buffers": [SLUG_FILL_VERTEX_LAYOUT],
+            },
+            fragment={
+                "module": shader_module,
+                "entry_point": "fs_main",
+                "targets": [{"format": wgpu.TextureFormat.rgba8unorm, "blend": _blend}],
+            },
+            primitive={"topology": "triangle-list", "cull_mode": "none"},
+            depth_stencil={
+                "format": wgpu.TextureFormat.depth24plus,
+                "depth_write_enabled": False,
+                "depth_compare": "always",
+                "stencil_front": {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_back":  {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_read_mask": 0,
+                "stencil_write_mask": 0,
+            },
+            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
+        )
+        return slug_bgl, pipeline
+
     # ------------------------------------------------------------------
     # Camera bind group (rebuilt each frame when projection changes)
     # ------------------------------------------------------------------
+
+    def _build_camera_uniform_buf(self) -> wgpu_t.GPUBuffer:
+        """Pack the 144-byte camera uniform and upload it; return the buffer."""
+        assert self._device is not None
+        proj_bytes  = self.camera.projection_matrix.T.flatten().tobytes()
+        view_bytes  = self.camera.view_matrix.T.flatten().tobytes()
+        light       = np.zeros(4, dtype=np.float32)
+        light[:3]   = self.camera.light_source_position.astype(np.float32)
+        light_bytes = light.tobytes()
+
+        buf = self._device.create_buffer_with_data(
+            data=proj_bytes + view_bytes + light_bytes,
+            usage=wgpu.BufferUsage.UNIFORM,
+        )
+        self.frame_vbos.append(buf)
+        return buf
 
     def _build_camera_bind_group(self) -> wgpu_t.GPUBindGroup:
         assert self._device is not None
         assert self._proj_bgl is not None
 
-        # Pack uniform buffer: projection (64 B) + view (64 B) + light_pos+pad (16 B) = 144 B.
-        # WGSL mat4x4<f32> is column-major: transpose → flatten before packing.
-        proj_bytes = self.camera.projection_matrix.T.flatten().tobytes()   # 64 bytes
-        view_bytes = self.camera.view_matrix.T.flatten().tobytes()          # 64 bytes
-        light = np.zeros(4, dtype=np.float32)
-        light[:3] = self.camera.light_source_position.astype(np.float32)
-        light_bytes = light.tobytes()                                        # 16 bytes
-
-        uniform_data = proj_bytes + view_bytes + light_bytes  # 144 bytes
-
-        proj_buf = self._device.create_buffer_with_data(
-            data=uniform_data,
-            usage=wgpu.BufferUsage.UNIFORM,
-        )
-        self.frame_vbos.append(proj_buf)
+        self._camera_uniform_buf = self._build_camera_uniform_buf()
 
         return self._device.create_bind_group(
             layout=self._proj_bgl,
             entries=[
-                {"binding": 0, "resource": {"buffer": proj_buf, "offset": 0, "size": 144}}
+                {"binding": 0, "resource": {"buffer": self._camera_uniform_buf, "offset": 0, "size": 144}}
+            ],
+        )
+
+    def _build_slug_bind_group(
+        self, curves_buf: wgpu_t.GPUBuffer
+    ) -> wgpu_t.GPUBindGroup:
+        """Build the Slug fill bind group: camera uniform + curves storage buffer."""
+        assert self._device is not None
+        assert self._slug_bgl is not None
+        assert self._camera_uniform_buf is not None, (
+            "_build_camera_bind_group() must be called before _build_slug_bind_group()"
+        )
+        return self._device.create_bind_group(
+            layout=self._slug_bgl,
+            entries=[
+                {"binding": 0, "resource": {"buffer": self._camera_uniform_buf, "offset": 0, "size": 144}},
+                {"binding": 1, "resource": {"buffer": curves_buf, "offset": 0, "size": curves_buf.size}},
             ],
         )
 
@@ -605,11 +641,6 @@ class WebGPURenderer:
         return self._device
 
     @property
-    def fill_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        assert self._fill_pipeline is not None, "init_scene() has not been called"
-        return self._fill_pipeline
-
-    @property
     def stroke_pipeline(self) -> wgpu_t.GPURenderPipeline:
         assert self._stroke_pipeline is not None, "init_scene() has not been called"
         return self._stroke_pipeline
@@ -618,6 +649,11 @@ class WebGPURenderer:
     def surface_pipeline(self) -> wgpu_t.GPURenderPipeline:
         assert self._surface_pipeline is not None, "init_scene() has not been called"
         return self._surface_pipeline
+
+    @property
+    def slug_fill_pipeline(self) -> wgpu_t.GPURenderPipeline:
+        assert self._slug_fill_pipeline is not None, "init_scene() has not been called"
+        return self._slug_fill_pipeline
 
     # ------------------------------------------------------------------
     # Frame rendering

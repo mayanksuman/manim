@@ -232,11 +232,15 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.uv_curve_2 = uv2;
     out.uv_curve_3 = uv3;
 
-    // Tight bounding quad: cubic AABB padded by the stroke thickness.
+    // Tight bounding quad: cubic AABB padded by the stroke thickness plus a
+    // small extra margin for the anti-aliasing fringe (≈1 pixel in UV space).
+    // thickness_multiplier * 1.0 pixel ≈ aa_pad estimate; we use a fixed
+    // conservative constant that matches the thickness_multiplier scale.
     let t      = out.v_thickness;
+    let aa_pad = thickness_multiplier * 2.0; // ~1–2 px feather margin in UV
     let uv_bb  = bbox_cubic(uv0, uv1, uv2, uv3);
-    let uv_min = uv_bb.xy - vec2<f32>(t);
-    let uv_max = uv_bb.zw + vec2<f32>(t);
+    let uv_min = uv_bb.xy - vec2<f32>(t + aa_pad);
+    let uv_max = uv_bb.zw + vec2<f32>(t + aa_pad);
 
     // tile_coordinate ∈ [0,1]² → lerp within [uv_min, uv_max].
     let uv_tile = mix(uv_min, uv_max, in.tile_coordinate);
@@ -257,8 +261,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         in.uv_curve_0, in.uv_curve_1, in.uv_curve_2, in.uv_curve_3,
         in.uv_point,
     );
-    if (dist < in.v_thickness) {
-        return in.v_color;
-    }
-    discard;
+
+    // ── Analytic SDF anti-aliasing ──────────────────────────────────────────
+    //
+    // fwidthFine(dist) returns |∂dist/∂x| + |∂dist/∂y|, which approximates
+    // the change in UV-space distance over one screen pixel.  We use half of
+    // that as the half-width of the smooth transition band:
+    //
+    //   coverage = 1  when dist ≤ thickness − half_px   (fully inside)
+    //   coverage = 0  when dist ≥ thickness + half_px   (fully outside)
+    //
+    // smoothstep interpolates smoothly between those limits.
+    let px        = fwidthFine(dist);          // ≈ 1 px in UV units
+    let half_px   = 0.5 * px;
+    let edge_low  = in.v_thickness - half_px;
+    let edge_high = in.v_thickness + half_px;
+    let coverage  = 1.0 - smoothstep(edge_low, edge_high, dist);
+
+    // Fully outside the anti-aliased fringe — discard to avoid touching the
+    // depth/stencil buffer unnecessarily.
+    if (coverage <= 0.0) { discard; }
+
+    // Multiply the stored alpha by the smooth SDF coverage so transparent
+    // strokes composite correctly.
+    return vec4<f32>(in.v_color.rgb, in.v_color.a * coverage);
 }

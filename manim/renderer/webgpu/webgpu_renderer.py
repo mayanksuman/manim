@@ -573,7 +573,7 @@ class WebGPURenderer:
             depth_bias_clamp=0.00001,
         )
         self._surface_pipeline            = self._create_surface_pipeline(self._proj_bgl, cull_mode="none",  depth_write=True)
-        self._slug_bgl, self._slug_fill_pipeline    = self._create_slug_fill_pipeline(depth_test=True)
+        self._slug_bgl, self._slug_fill_pipeline    = self._create_slug_fill_pipeline(depth_test=False)
         _,              self._slug_fill_3d_pipeline = self._create_slug_fill_pipeline(depth_test=True)
         self._create_oit_resources(width, height)
         self._create_readback_pipeline(width, height)

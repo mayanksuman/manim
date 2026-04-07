@@ -381,7 +381,10 @@ def render_webgpu_mobject(
 
     # ── Phase 3: draw in the main render pass ─────────────────────────────
     # Execute in this fixed order:
-    #   slug_fill → surface_opaque → stroke_2d → stroke_3d → stroke_surface
+    #   (slug_fill + stroke_2d interleaved, in draw_plan order) →
+    #   slug_fill_3d → surface_opaque → stroke_3d → stroke_surface
+    # 2-D fill/stroke are interleaved per-object to match Cairo's painter's algorithm:
+    #   object A: fill → stroke; object B: fill → stroke (in z_index order).
     # stroke_surface uses a depth-biased pipeline so mesh lines sitting exactly
     # on the surface never z-fight with it.
     # surface_oit entries are skipped here and returned for a separate OIT pass.
@@ -414,19 +417,30 @@ def render_webgpu_mobject(
 
     _cur: list[str | None] = [None]  # mutable current-pipeline tracker
 
-    # 1. Slug fills (2-D — no depth test)
-    if slug_fill_vbo is not None:
-        for cmd_type, idx in draw_plan:
-            if cmd_type == "slug_fill":
-                if _cur[0] != "slug_fill":
-                    rp.set_pipeline(renderer.slug_fill_pipeline)
-                    rp.set_bind_group(0, slug_bind_group, [], 0, 0)
-                    _cur[0] = "slug_fill"
-                arr = slug_quad_parts[idx]
-                rp.set_vertex_buffer(0, slug_fill_vbo, slug_fill_byte_offsets[idx], arr.nbytes)
-                rp.draw(len(arr), 1, 0, 0)
+    # 1. 2-D objects: fill and stroke interleaved in draw_plan order (painter's algorithm).
+    #    slug_fill uses no-depth-test pipeline; stroke_2d uses no-depth-write pipeline.
+    #    Iterating once keeps Cairo's per-object fill→stroke ordering so object B drawn
+    #    on top of A has its fill above A's stroke, matching Cairo's painter's algorithm.
+    for cmd_type, idx in draw_plan:
+        if cmd_type == "slug_fill" and slug_fill_vbo is not None:
+            if _cur[0] != "slug_fill":
+                rp.set_pipeline(renderer.slug_fill_pipeline)
+                rp.set_bind_group(0, slug_bind_group, [], 0, 0)
+                _cur[0] = "slug_fill"
+            arr = slug_quad_parts[idx]
+            rp.set_vertex_buffer(0, slug_fill_vbo, slug_fill_byte_offsets[idx], arr.nbytes)
+            rp.draw(len(arr), 1, 0, 0)
+        elif cmd_type == "stroke_2d" and stroke_buf is not None:
+            if _cur[0] != "stroke_2d":
+                rp.set_pipeline(renderer.stroke_pipeline)
+                rp.set_bind_group(0, cam_bg, [], 0, 0)
+                _cur[0] = "stroke_2d"
+            arr = stroke_parts[idx]
+            rp.set_vertex_buffer(0, stroke_buf, stroke_byte_offsets[idx], arr.nbytes)
+            rp.draw(len(arr), 1, 0, 0)
 
-        # 1b. Slug fills (3-D — depth-tested, shade_in_3d with fill)
+    # 1b. 3-D Slug fills (shade_in_3d with fill — depth-tested)
+    if slug_fill_vbo is not None:
         for cmd_type, idx in draw_plan:
             if cmd_type == "slug_fill_3d":
                 if _cur[0] != "slug_fill_3d":
@@ -443,18 +457,13 @@ def render_webgpu_mobject(
             if cmd_type == "surface_opaque":
                 _draw_surface(idx, renderer.surface_pipeline, "surface_opaque", _cur)
 
-    # 5. 2-D strokes
+    # 3. 3-D strokes (depth-tested)
     if stroke_buf is not None:
-        for cmd_type, idx in draw_plan:
-            if cmd_type == "stroke_2d":
-                _draw_stroke(idx, "stroke_2d", _cur)
-
-        # 6. 3-D strokes (depth-tested)
         for cmd_type, idx in draw_plan:
             if cmd_type == "stroke_3d":
                 _draw_stroke(idx, "stroke_3d", _cur)
 
-        # 7. Surface mesh strokes (depth-biased to prevent z-fighting)
+        # 4. Surface mesh strokes (depth-biased to prevent z-fighting)
         for cmd_type, idx in draw_plan:
             if cmd_type == "stroke_surface":
                 _draw_stroke(idx, "stroke_surface", _cur)

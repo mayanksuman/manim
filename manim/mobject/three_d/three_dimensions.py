@@ -343,7 +343,7 @@ class Surface(VGroup, metaclass=ConvertToOpenGL):
                         if config.renderer == RendererType.OPENGL:
                             assert isinstance(mob, OpenGLMobject)
                             mob.set_color(mob_color, recurse=False)
-                        elif config.renderer == RendererType.CAIRO:
+                        elif config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
                             mob.set_color(mob_color, family=False)
                         break
 
@@ -452,7 +452,7 @@ class Sphere(Surface):
     ) -> None:
         if config.renderer == RendererType.OPENGL:
             res_value = (101, 51)
-        elif config.renderer == RendererType.CAIRO:
+        elif config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
             res_value = (24, 12)
         else:
             raise Exception("Unknown renderer")
@@ -882,7 +882,7 @@ class Cylinder(Surface):
             assert isinstance(self, OpenGLMobject)
             color = self.color
             opacity = self.opacity
-        elif config.renderer == RendererType.CAIRO:
+        elif config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
             color = self.fill_color
             opacity = self.fill_opacity
 
@@ -1316,7 +1316,7 @@ class Torus(Surface):
     ) -> None:
         if config.renderer == RendererType.OPENGL:
             res_value = (101, 101)
-        elif config.renderer == RendererType.CAIRO:
+        elif config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
             res_value = (24, 24)
 
         resolution = resolution if resolution is not None else res_value

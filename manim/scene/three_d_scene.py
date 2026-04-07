@@ -19,6 +19,7 @@ from manim.mobject.value_tracker import ValueTracker
 from .. import config
 from ..animation.animation import Animation
 from ..animation.transform import Transform
+from ..animation.updaters.update import UpdateFromAlphaFunc
 from ..camera.three_d_camera import ThreeDCamera
 from ..constants import DEGREES, RendererType
 from ..mobject.mobject import Mobject
@@ -134,6 +135,15 @@ class ThreeDScene(Scene):
                 }
                 cam.add_updater(lambda m, dt: methods[about](rate * dt))
                 self.add(self.camera)
+            elif config.renderer == RendererType.WEBGPU:
+                cam = self.renderer.camera
+                methods = {
+                    "theta": cam.increment_theta,
+                    "phi": cam.increment_phi,
+                    "gamma": cam.increment_gamma,
+                }
+                cam.add_updater(lambda m, dt: methods[about](rate * dt))
+                self.add(cam)
         except Exception as e:
             raise ValueError("Invalid ambient rotation angle.") from e
 
@@ -152,6 +162,8 @@ class ThreeDScene(Scene):
                 self.remove(x)
             elif config.renderer == RendererType.OPENGL:
                 self.camera.clear_updaters()
+            elif config.renderer == RendererType.WEBGPU:
+                self.renderer.camera.clear_updaters()
         except Exception as e:
             raise ValueError("Invalid ambient rotation angle.") from e
 
@@ -176,6 +188,28 @@ class ThreeDScene(Scene):
             The azimutal angle the camera should move around. Defaults
             to the current theta angle.
         """
+        if config.renderer == RendererType.WEBGPU:
+            cam = self.renderer.camera
+            if origin_theta is None:
+                origin_theta = cam.euler_angles[0]
+            if origin_phi is None:
+                origin_phi = cam.euler_angles[1]
+
+            _theta_t = ValueTracker(0)
+            _phi_t = ValueTracker(0)
+
+            def update_cam_illusion(m, dt):
+                _theta_t.increment_value(dt * rate)
+                _phi_t.increment_value(dt * rate)
+                m.set_euler_angles(
+                    theta=origin_theta + 0.2 * np.sin(_theta_t.get_value()),
+                    phi=origin_phi + 0.1 * np.cos(_phi_t.get_value()) - 0.1,
+                )
+
+            cam.add_updater(update_cam_illusion)
+            self.add(cam)
+            return
+
         if origin_theta is None:
             origin_theta = self.renderer.camera.theta_tracker.get_value()
         if origin_phi is None:
@@ -203,6 +237,10 @@ class ThreeDScene(Scene):
 
     def stop_3dillusion_camera_rotation(self):
         """This method stops all illusion camera rotations."""
+        if config.renderer == RendererType.WEBGPU:
+            self.renderer.camera.clear_updaters()
+            self.remove(self.renderer.camera)
+            return
         self.renderer.camera.theta_tracker.clear_updaters()
         self.remove(self.renderer.camera.theta_tracker)
         self.renderer.camera.phi_tracker.clear_updaters()
@@ -300,6 +338,31 @@ class ThreeDScene(Scene):
 
             anims += [Transform(cam, cam2)]
 
+        elif config.renderer == RendererType.WEBGPU:
+            cam = self.renderer.camera
+            start_theta = cam.euler_angles[0]
+            start_phi = cam.euler_angles[1]
+            start_gamma = cam.euler_angles[2]
+            target_theta = theta if theta is not None else start_theta
+            target_phi = phi if phi is not None else start_phi
+            target_gamma = gamma if gamma is not None else start_gamma
+
+            def update_cam(m, alpha):
+                m.set_euler_angles(
+                    theta=start_theta + alpha * (target_theta - start_theta),
+                    phi=start_phi + alpha * (target_phi - start_phi),
+                    gamma=start_gamma + alpha * (target_gamma - start_gamma),
+                )
+
+            anims.append(UpdateFromAlphaFunc(cam, update_cam))
+
+            if focal_distance is not None:
+                start_fd = cam.focal_distance
+                anims.append(UpdateFromAlphaFunc(
+                    cam,
+                    lambda m, a, _s=start_fd: setattr(m, "focal_distance", _s + a * (focal_distance - _s)),
+                ))
+
         self.play(*anims + added_anims, **kwargs)
 
         # These lines are added to improve performance. If manim thinks that frame_center is moving,
@@ -353,6 +416,9 @@ class ThreeDScene(Scene):
                 mob: OpenGLMobject
                 mob.fix_orientation()
                 self.add(mob)
+        elif config.renderer == RendererType.WEBGPU:
+            self.renderer.camera.add_fixed_orientation_mobjects(*mobjects)
+            self.add(*mobjects)
 
     def add_fixed_in_frame_mobjects(self, *mobjects: Mobject):
         """
@@ -375,6 +441,9 @@ class ThreeDScene(Scene):
                 mob: OpenGLMobject
                 mob.fix_in_frame()
                 self.add(mob)
+        elif config.renderer == RendererType.WEBGPU:
+            self.renderer.camera.add_fixed_in_frame_mobjects(*mobjects)
+            self.add(*mobjects)
 
     def remove_fixed_orientation_mobjects(self, *mobjects: Mobject):
         """
@@ -395,6 +464,9 @@ class ThreeDScene(Scene):
                 mob: OpenGLMobject
                 mob.unfix_orientation()
                 self.remove(mob)
+        elif config.renderer == RendererType.WEBGPU:
+            self.renderer.camera.remove_fixed_orientation_mobjects(*mobjects)
+            self.remove(*mobjects)
 
     def remove_fixed_in_frame_mobjects(self, *mobjects: Mobject):
         """
@@ -414,6 +486,9 @@ class ThreeDScene(Scene):
                 mob: OpenGLMobject
                 mob.unfix_from_frame()
                 self.remove(mob)
+        elif config.renderer == RendererType.WEBGPU:
+            self.renderer.camera.remove_fixed_in_frame_mobjects(*mobjects)
+            self.remove(*mobjects)
 
     ##
     def set_to_default_angled_camera_orientation(self, **kwargs):

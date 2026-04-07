@@ -1,9 +1,9 @@
 // WebGPU fill shader using the Slug algorithm.
 //
-// Renders VMobject fill with exact, analytical winding-number coverage and
-// smooth sub-pixel anti-aliasing.  No CPU tessellation is required — raw
-// quadratic bezier control points are uploaded once per frame in a storage
-// buffer, and coverage is computed entirely in the fragment shader.
+// Supports both 2-D and 3-D VMobjects.  Coverage is computed in view-space XY,
+// which is a rigid transform of world space so pixel-scale distances remain
+// valid.  Curve control points are stored as world-space vec3 and transformed
+// to view-space XY in the fragment shader.
 //
 // Reference:
 //   E. Lengyel, "GPU-Centered Font Rendering Directly from Glyph Outlines",
@@ -15,14 +15,16 @@
 //   offset  64 — view        mat4x4<f32>  (64 bytes)
 //   offset 128 — light_pos   vec3<f32>    (12 bytes, padded to 16)
 //
-// Storage buffer (group 0, binding 1) — flat array of vec2<f32>:
-//   curves[i*3 + 0] = p1  (start anchor of quadratic bezier i)
-//   curves[i*3 + 1] = p2  (single control point)
-//   curves[i*3 + 2] = p3  (end anchor)
-//   All coordinates in Manim world space.
+// Storage buffer (group 0, binding 1) — tightly packed array<f32>:
+//   For quadratic bezier i: floats at indices [i*9 .. i*9+8]
+//     [0,1,2] = p1 XYZ  (start anchor)
+//     [3,4,5] = p2 XYZ  (control point)
+//     [6,7,8] = p3 XYZ  (end anchor)
+//   Using array<f32> rather than array<vec3<f32>> because WGSL gives vec3
+//   a 16-byte stride in storage buffers, while Python packs them at 12 bytes.
 //
 // Vertex attributes:
-//   location 0 — in_pos       vec2<f32>   world-space bounding-quad corner
+//   location 0 — in_pos       vec3<f32>   world-space 3-D position of bounding-quad corner
 //   location 1 — in_color     vec4<f32>   RGBA fill colour
 //   location 2 — curve_start  u32         first curve index in storage buffer
 //   location 3 — n_curves     u32         number of quadratic bezier curves
@@ -35,11 +37,11 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 
-// Flat array of vec2 control points: three entries per quadratic bezier curve.
-@group(0) @binding(1) var<storage, read> curves : array<vec2<f32>>;
+// Tightly packed floats: 9 floats per quadratic bezier (3 points × 3 floats).
+@group(0) @binding(1) var<storage, read> curves : array<f32>;
 
 struct VertexInput {
-    @location(0) in_pos      : vec2<f32>,
+    @location(0) in_pos      : vec3<f32>,
     @location(1) in_color    : vec4<f32>,
     @location(2) curve_start : u32,
     @location(3) n_curves    : u32,
@@ -47,7 +49,7 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position)              clip_pos    : vec4<f32>,
-    @location(0)                    world_pos   : vec2<f32>,
+    @location(0)                    view_pos_xy : vec2<f32>,   // view-space XY for coverage
     @location(1)                    v_color     : vec4<f32>,
     @location(2) @interpolate(flat) curve_start : u32,
     @location(3) @interpolate(flat) n_curves    : u32,
@@ -56,8 +58,9 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_pos    = u.projection * u.view * vec4<f32>(in.in_pos, 0.0, 1.0);
-    out.world_pos   = in.in_pos;
+    let view_pos    = u.view * vec4<f32>(in.in_pos, 1.0);
+    out.clip_pos    = u.projection * view_pos;
+    out.view_pos_xy = view_pos.xy;
     out.v_color     = in.in_color;
     out.curve_start = in.curve_start;
     out.n_curves    = in.n_curves;
@@ -153,21 +156,26 @@ fn calc_coverage(xcov: f32, ycov: f32, xwgt: f32, ywgt: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // World units per screen pixel — lets coverage calculations work in
-    // pixel units regardless of zoom or resolution.
-    let ems_per_pixel = fwidth(in.world_pos);
+    // View-space units per screen pixel — coverage math works in these units
+    // regardless of zoom, resolution, or 3-D orientation.
+    let ems_per_pixel = fwidth(in.view_pos_xy);
     let pixels_per_em = 1.0 / max(ems_per_pixel, vec2<f32>(1e-9));
 
     var xcov = 0.0;  var xwgt = 0.0;
     var ycov = 0.0;  var ywgt = 0.0;
 
     for (var i = 0u; i < in.n_curves; i = i + 1u) {
-        let base = (in.curve_start + i) * 3u;
+        // 9 floats per quadratic: p1 (xyz), p2 (xyz), p3 (xyz).
+        let f = (in.curve_start + i) * 9u;
+        let p1w = vec3<f32>(curves[f    ], curves[f + 1u], curves[f + 2u]);
+        let p2w = vec3<f32>(curves[f + 3u], curves[f + 4u], curves[f + 5u]);
+        let p3w = vec3<f32>(curves[f + 6u], curves[f + 7u], curves[f + 8u]);
 
-        // Shift curve so the current fragment is the origin.
-        let p1 = curves[base      ] - in.world_pos;
-        let p2 = curves[base + 1u ] - in.world_pos;
-        let p3 = curves[base + 2u ] - in.world_pos;
+        // Transform world-space curve control points to view-space XY,
+        // then shift so the current fragment is the origin.
+        let p1 = (u.view * vec4<f32>(p1w, 1.0)).xy - in.view_pos_xy;
+        let p2 = (u.view * vec4<f32>(p2w, 1.0)).xy - in.view_pos_xy;
+        let p3 = (u.view * vec4<f32>(p3w, 1.0)).xy - in.view_pos_xy;
 
         // ── Horizontal ray: accumulate x-coverage ────────────────────────
         let hcode = calc_root_code(p1.y, p2.y, p3.y);

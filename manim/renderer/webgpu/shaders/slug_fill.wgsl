@@ -1,9 +1,11 @@
 // WebGPU fill shader using the Slug algorithm.
 //
-// Supports both 2-D and 3-D VMobjects.  Coverage is computed in view-space XY,
-// which is a rigid transform of world space so pixel-scale distances remain
-// valid.  Curve control points are stored as world-space vec3 and transformed
-// to view-space XY in the fragment shader.
+// Supports both 2-D and 3-D VMobjects, orthographic and perspective cameras.
+// Coverage is computed in NDC space (clip.xy / clip.w), which is the correct
+// 2-D space for all projection types:
+//   - Orthographic: clip.w = 1, so NDC = clip.xy (a uniform scale of view XY).
+//   - Perspective:  NDC accounts for the depth-dependent scale, so fills and
+//                   strokes rendered on tilted 3-D objects stay aligned.
 //
 // Reference:
 //   E. Lengyel, "GPU-Centered Font Rendering Directly from Glyph Outlines",
@@ -49,7 +51,7 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position)              clip_pos    : vec4<f32>,
-    @location(0)                    view_pos_xy : vec2<f32>,   // view-space XY for coverage
+    @location(0)                    ndc_xy      : vec2<f32>,   // NDC XY = clip.xy / clip.w
     @location(1)                    v_color     : vec4<f32>,
     @location(2) @interpolate(flat) curve_start : u32,
     @location(3) @interpolate(flat) n_curves    : u32,
@@ -59,8 +61,11 @@ struct VertexOutput {
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     let view_pos    = u.view * vec4<f32>(in.in_pos, 1.0);
-    out.clip_pos    = u.projection * view_pos;
-    out.view_pos_xy = view_pos.xy;
+    let clip        = u.projection * view_pos;
+    out.clip_pos    = clip;
+    // Perspective divide: under ortho w=1 (no change), under perspective this
+    // maps the vertex to the correct screen-proportional 2-D position.
+    out.ndc_xy      = clip.xy / clip.w;
     out.v_color     = in.in_color;
     out.curve_start = in.curve_start;
     out.n_curves    = in.n_curves;
@@ -156,13 +161,15 @@ fn calc_coverage(xcov: f32, ycov: f32, xwgt: f32, ywgt: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // View-space units per screen pixel — coverage math works in these units
-    // regardless of zoom, resolution, or 3-D orientation.
-    let ems_per_pixel = fwidth(in.view_pos_xy);
-    let pixels_per_em = 1.0 / max(ems_per_pixel, vec2<f32>(1e-9));
+    // NDC units per screen pixel — coverage math works in these units for both
+    // orthographic and perspective projections.
+    let ndc_per_pixel  = fwidth(in.ndc_xy);
+    let pixels_per_ndc = 1.0 / max(ndc_per_pixel, vec2<f32>(1e-9));
 
     var xcov = 0.0;  var xwgt = 0.0;
     var ycov = 0.0;  var ywgt = 0.0;
+
+    let pv = u.projection * u.view;  // combined matrix — avoids recomputing per curve
 
     for (var i = 0u; i < in.n_curves; i = i + 1u) {
         // 9 floats per quadratic: p1 (xyz), p2 (xyz), p3 (xyz).
@@ -171,16 +178,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let p2w = vec3<f32>(curves[f + 3u], curves[f + 4u], curves[f + 5u]);
         let p3w = vec3<f32>(curves[f + 6u], curves[f + 7u], curves[f + 8u]);
 
-        // Transform world-space curve control points to view-space XY,
-        // then shift so the current fragment is the origin.
-        let p1 = (u.view * vec4<f32>(p1w, 1.0)).xy - in.view_pos_xy;
-        let p2 = (u.view * vec4<f32>(p2w, 1.0)).xy - in.view_pos_xy;
-        let p3 = (u.view * vec4<f32>(p3w, 1.0)).xy - in.view_pos_xy;
+        // Transform world-space control points to NDC, then shift so the
+        // current fragment (in.ndc_xy) is the origin.
+        // NDC = clip.xy / clip.w handles both orthographic (w=1) and
+        // perspective (w = -z_view) correctly.
+        let c1 = pv * vec4<f32>(p1w, 1.0);
+        let c2 = pv * vec4<f32>(p2w, 1.0);
+        let c3 = pv * vec4<f32>(p3w, 1.0);
+        let p1 = c1.xy / c1.w - in.ndc_xy;
+        let p2 = c2.xy / c2.w - in.ndc_xy;
+        let p3 = c3.xy / c3.w - in.ndc_xy;
 
         // ── Horizontal ray: accumulate x-coverage ────────────────────────
         let hcode = calc_root_code(p1.y, p2.y, p3.y);
         if hcode != 0u {
-            let r = solve_horiz(p1, p2, p3) * pixels_per_em.x;
+            let r = solve_horiz(p1, p2, p3) * pixels_per_ndc.x;
             if (hcode & 1u) != 0u {
                 xcov += clamp(r.x + 0.5, 0.0, 1.0);
                 xwgt  = max(xwgt, clamp(1.0 - abs(r.x) * 2.0, 0.0, 1.0));
@@ -194,7 +206,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // ── Vertical ray: accumulate y-coverage ──────────────────────────
         let vcode = calc_root_code(p1.x, p2.x, p3.x);
         if vcode != 0u {
-            let r = solve_vert(p1, p2, p3) * pixels_per_em.y;
+            let r = solve_vert(p1, p2, p3) * pixels_per_ndc.y;
             if (vcode & 1u) != 0u {
                 ycov -= clamp(r.x + 0.5, 0.0, 1.0);
                 ywgt  = max(ywgt, clamp(1.0 - abs(r.x) * 2.0, 0.0, 1.0));

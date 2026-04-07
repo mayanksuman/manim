@@ -82,7 +82,7 @@ class WebGPUCamera(Mobject):
 
     Projection
     ----------
-    * 2-D scenes (default): orthographic, z mapped to the WebGPU [0, 1] NDC
+    * 2-D scenes: orthographic, z mapped to the WebGPU [0, 1] NDC
       range.
     * 3-D scenes (Phase 3): perspective projection driven by ``focal_distance``
       and the Euler-angle view matrix.
@@ -117,7 +117,7 @@ class WebGPUCamera(Mobject):
         center_point: np.ndarray | None = None,
         euler_angles: np.ndarray | None = None,
         focal_distance: float = 2.0,
-        orthographic: bool = True,
+        orthographic: bool = False,
         minimum_polar_angle: float = -PI / 2,
         maximum_polar_angle: float = PI / 2,
     ) -> None:
@@ -353,7 +353,7 @@ class WebGPUCamera(Mobject):
     def projection_matrix(self) -> np.ndarray:
         """4×4 float32 projection matrix in WebGPU NDC convention (z ∈ [0, 1]).
 
-        Orthographic when ``self.orthographic`` is True (default).
+        Perspective when ``self.orthographic`` is False (default).
         Perspective otherwise — focal distance drives the field of view.
         """
         fw, fh = self.frame_shape
@@ -556,24 +556,24 @@ class WebGPURenderer:
         self._depth_texture_view = self._depth_texture.create_view()
 
         self._proj_bgl = self._create_camera_bgl()
-        self._stroke_pipeline    = self._create_stroke_pipeline(self._proj_bgl, depth_test=False)
+        self._stroke_pipeline    = self._create_stroke_pipeline(self._proj_bgl, depth_test=True)
         self._stroke_3d_pipeline = self._create_stroke_pipeline(self._proj_bgl, depth_test=True)
         # Surface mesh lines sit exactly on the surface triangles.  A negative
         # depth bias pulls each fragment slightly toward the camera so the mesh
         # always wins the depth test without visually offsetting the lines.
-        # depth_bias=-100 gives ~6e-6 constant offset in [0,1] depth space
+        # depth_bias=-10000 gives ~6e-4 constant offset in [0,1] depth space
         # (depth24plus unit ≈ 6e-8), which is large enough to reliably beat
         # floating-point depth jitter on flat/low-slope surface regions where
         # depth_bias_slope_scale alone contributes nearly zero.
         self._stroke_3d_surface_pipeline = self._create_stroke_pipeline(
             self._proj_bgl,
             depth_test=True,
-            depth_bias=-1000,
+            depth_bias=-10000,
             depth_bias_slope_scale=-1.0,
-            depth_bias_clamp=0.001,
+            depth_bias_clamp=0.00001,
         )
         self._surface_pipeline            = self._create_surface_pipeline(self._proj_bgl, cull_mode="none",  depth_write=True)
-        self._slug_bgl, self._slug_fill_pipeline    = self._create_slug_fill_pipeline(depth_test=False)
+        self._slug_bgl, self._slug_fill_pipeline    = self._create_slug_fill_pipeline(depth_test=True)
         _,              self._slug_fill_3d_pipeline = self._create_slug_fill_pipeline(depth_test=True)
         self._create_oit_resources(width, height)
         self._create_readback_pipeline(width, height)

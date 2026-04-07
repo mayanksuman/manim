@@ -237,6 +237,7 @@ def render_webgpu_mobject(
     import wgpu  # local import so module loads without wgpu installed
 
     view_matrix: np.ndarray = renderer.camera.view_matrix
+    proj_matrix: np.ndarray = renderer.camera.projection_matrix
 
     # ── Phase 1: tessellate ───────────────────────────────────────────────
     slug_quad_parts:  list[np.ndarray] = []
@@ -289,20 +290,20 @@ def render_webgpu_mobject(
 
                 if has_fill:
                     # 3-D flat VMobject with fill (e.g. number-plane, polygon in 3D):
+                    # Cache only geometry-dependent curve data; rebuild the bounding
+                    # quad every frame so it tracks the current camera correctly.
                     cached = _slug_fill_cache.get(submob)
-                    if cached is not None and cached[0] == phash:
-                        quad_verts, curves_flat = cached[1]
-                        draw_plan.append(("slug_fill_3d", len(slug_quad_parts)))
-                        slug_quad_parts.append(quad_verts.copy())
-                        slug_curve_parts.append(curves_flat)
-                    else:
-                        slug_data = _collect_slug_fill_geometry(submob, view_matrix)
+                    if cached is None or cached[0] != phash:
+                        slug_data = _collect_slug_fill_geometry(submob)
                         if slug_data is not None:
                             _slug_fill_cache[submob] = (phash, slug_data)
-                            quad_verts, curves_flat = slug_data
-                            draw_plan.append(("slug_fill_3d", len(slug_quad_parts)))
-                            slug_quad_parts.append(quad_verts.copy())
-                            slug_curve_parts.append(curves_flat)
+                    cached = _slug_fill_cache.get(submob)
+                    if cached is not None and cached[0] == phash:
+                        color_c, curves_flat = cached[1]
+                        quad_verts = _build_slug_quad(color_c, curves_flat, view_matrix, proj_matrix)
+                        draw_plan.append(("slug_fill_3d", len(slug_quad_parts)))
+                        slug_quad_parts.append(quad_verts)
+                        slug_curve_parts.append(curves_flat)
 
                 # 3-D stroke logic (axis lines, etc.)
                 if scached is not None and scached[0] == phash:
@@ -318,19 +319,17 @@ def render_webgpu_mobject(
             else:
                 # ── 2-D object: Slug fill + 2-D stroke ──────────────────────
                 cached = _slug_fill_cache.get(submob)
-                if cached is not None and cached[0] == phash:
-                    quad_verts, curves_flat = cached[1]
-                    draw_plan.append(("slug_fill", len(slug_quad_parts)))
-                    slug_quad_parts.append(quad_verts.copy())
-                    slug_curve_parts.append(curves_flat)
-                else:
-                    slug_data = _collect_slug_fill_geometry(submob, view_matrix)
+                if cached is None or cached[0] != phash:
+                    slug_data = _collect_slug_fill_geometry(submob)
                     if slug_data is not None:
                         _slug_fill_cache[submob] = (phash, slug_data)
-                        quad_verts, curves_flat = slug_data
-                        draw_plan.append(("slug_fill", len(slug_quad_parts)))
-                        slug_quad_parts.append(quad_verts.copy())
-                        slug_curve_parts.append(curves_flat)
+                cached = _slug_fill_cache.get(submob)
+                if cached is not None and cached[0] == phash:
+                    color_c, curves_flat = cached[1]
+                    quad_verts = _build_slug_quad(color_c, curves_flat, view_matrix, proj_matrix)
+                    draw_plan.append(("slug_fill", len(slug_quad_parts)))
+                    slug_quad_parts.append(quad_verts)
+                    slug_curve_parts.append(curves_flat)
 
                 if scached is not None and scached[0] == phash:
                     draw_plan.append(("stroke_2d", len(stroke_parts)))
@@ -694,26 +693,19 @@ def _collect_surface_geometry(vmobject: VMobject) -> np.ndarray | None:
 
 def _collect_slug_fill_geometry(
     vmobject: VMobject,
-    view_matrix: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return ``(quad_verts, curves_flat)`` for the Slug fill pipeline, or ``None``.
+    """Return ``(color, curves_flat)`` for the Slug fill pipeline, or ``None``.
 
-    *quad_verts* is a ``_SLUG_FILL_DTYPE`` array of 6 vertices (world-space
-    3-D positions) forming a bounding quad for this shape in view space.
-    ``curve_start`` is set to 0 and must be patched to the global offset by
-    the caller before upload.
+    Only the camera-independent data is returned here so the result can be
+    cached purely on the vmobject's geometry.  The caller builds the
+    per-frame bounding quad via ``_build_slug_quad()`` using the current
+    view and projection matrices.
 
-    *curves_flat* is a ``float32`` array of shape ``(n_quads * 3, 3)``
-    containing the world-space XYZ coordinates of every quadratic bezier
-    control point — three consecutive entries (p1, p2, p3) per curve.
+    *color* is a float32 RGBA array.
 
-    Parameters
-    ----------
-    view_matrix
-        4×4 float32 view matrix (world → camera space).  When ``None`` an
-        identity matrix is used (2-D orthographic default).  The bounding quad
-        is computed in view space so it covers the projected shape regardless
-        of the object's 3-D orientation.
+    *curves_flat* is a ``float32`` array of shape ``(N * 3, 3)``
+    containing the world-space XYZ of every quadratic bezier control point
+    — three consecutive entries (p1, p2, p3) per curve.
     """
     fill_rgba = vmobject.get_fill_rgbas()
     if fill_rgba.shape[0] == 0 or fill_rgba[0, 3] == 0:
@@ -766,52 +758,89 @@ def _collect_slug_fill_geometry(
         return None
 
     curves_stacked = np.concatenate(per_subpath, axis=0)  # (N_total, 3, 3)
-    n_quads        = len(curves_stacked)
     curves_flat    = curves_stacked.reshape(-1, 3)         # (N_total * 3, 3)
 
-    # ── Bounding quad in view space ───────────────────────────────────────
-    # Transform all control points to view space, compute XY extent there,
-    # then map the 4 bounding corners back to world space for storage.
-    # This guarantees correct screen coverage for tilted 3-D objects.
-    if view_matrix is None:
-        view_matrix = np.eye(4, dtype=np.float32)
-    vm = view_matrix.astype(np.float32)
-    R, t = vm[:3, :3], vm[:3, 3]
-
-    pts_v = (R @ curves_flat.T).T + t          # (N*3, 3) view space
-
-    bbox_min = pts_v[:, :2].min(axis=0) - 0.05
-    bbox_max = pts_v[:, :2].max(axis=0) + 0.05
-    x0, y0   = float(bbox_min[0]), float(bbox_min[1])
-    x1, y1   = float(bbox_max[0]), float(bbox_max[1])
-    avg_z_v  = float(pts_v[:, 2].mean())
-
-    # Four corners in view space (same average Z).
-    corners_v = np.array(
-        [[x0, y0, avg_z_v], [x1, y0, avg_z_v],
-         [x0, y1, avg_z_v], [x1, y1, avg_z_v]],
-        dtype=np.float32,
-    )
-    # Invert the view matrix (rigid-body: R^T, -R^T t).
-    R_inv = R.T
-    t_inv = -(R_inv @ t)
-    corners_w = (R_inv @ corners_v.T).T + t_inv   # (4, 3) world space
-
-    # 6 vertices: two CCW triangles.
-    quad_pos = corners_w[[0, 1, 2, 1, 3, 2]]      # (6, 3)
-
-    quad_verts = np.empty(6, dtype=_SLUG_FILL_DTYPE)
-    quad_verts["in_pos"]      = quad_pos
-    quad_verts["in_color"]    = color
-    quad_verts["curve_start"] = 0       # patched to global offset by caller
-    quad_verts["n_curves"]    = n_quads
-
-    return quad_verts, curves_flat
+    # Return only the camera-independent curve data.  The caller builds the
+    # bounding quad each frame via _build_slug_quad() so it always reflects
+    # the current view and projection matrices.
+    return color, curves_flat
 
 
 # ---------------------------------------------------------------------------
 # Single-mobject draw helpers (used by the explicit public helpers above)
 # ---------------------------------------------------------------------------
+
+
+def _build_slug_quad(
+    color: np.ndarray,
+    curves_flat: np.ndarray,
+    view_matrix: np.ndarray,
+    proj_matrix: np.ndarray,
+) -> np.ndarray:
+    """Build a ``_SLUG_FILL_DTYPE`` bounding-quad array from cached curve data.
+
+    Called every frame so the quad always reflects the current view and
+    projection matrices.  The bounding box is computed in NDC space
+    (clip.xy / clip.w), which is correct for both orthographic (w=1) and
+    perspective projections, then mapped back to world space at avg_z.
+
+    Parameters
+    ----------
+    color       : float32 RGBA fill colour.
+    curves_flat : (N*3, 3) world-space control points from _collect_slug_fill_geometry.
+    view_matrix : current 4×4 view matrix.
+    proj_matrix : current 4×4 projection matrix.
+    """
+    n_quads = len(curves_flat) // 3
+    vm = view_matrix.astype(np.float32)
+    pm = proj_matrix.astype(np.float32)
+    R, t = vm[:3, :3], vm[:3, 3]
+
+    pts_v   = (R @ curves_flat.T).T + t          # (N*3, 3) view space
+    avg_z_v = float(pts_v[:, 2].mean())
+
+    # Perspective divide in NDC: works for both ortho (w=1) and perspective.
+    ones   = np.ones((len(pts_v), 1), dtype=np.float32)
+    pts_vh = np.hstack([pts_v, ones])             # (N*3, 4)
+    clips  = (pm @ pts_vh.T).T                   # (N*3, 4) clip space
+    w      = clips[:, 3:4]
+    w_safe = np.where(np.abs(w) > 1e-8, w, np.sign(w + 1e-38) * 1e-8)
+    ndcs   = clips[:, :2] / w_safe               # (N*3, 2) NDC XY
+
+    PAD = 0.05
+    ndc_min = ndcs.min(axis=0) - PAD
+    ndc_max = ndcs.max(axis=0) + PAD
+    x0_n, y0_n = float(ndc_min[0]), float(ndc_min[1])
+    x1_n, y1_n = float(ndc_max[0]), float(ndc_max[1])
+
+    # Invert NDC → view space at avg_z_v.
+    # ndc_x = (pm[0,0]*x_v + pm[0,3]) / w_clip  where w_clip = pm[3,2]*z + pm[3,3]
+    # Ortho: w_clip=1  |  Perspective: w_clip = -avg_z_v
+    avg_clip_w = float(pm[3, 2] * avg_z_v + pm[3, 3])
+    avg_clip_w = avg_clip_w if abs(avg_clip_w) > 1e-8 else 1.0
+    inv_px = 1.0 / (pm[0, 0] if abs(pm[0, 0]) > 1e-8 else 1.0)
+    inv_py = 1.0 / (pm[1, 1] if abs(pm[1, 1]) > 1e-8 else 1.0)
+    x0_v = (x0_n * avg_clip_w - float(pm[0, 3])) * inv_px
+    x1_v = (x1_n * avg_clip_w - float(pm[0, 3])) * inv_px
+    y0_v = (y0_n * avg_clip_w - float(pm[1, 3])) * inv_py
+    y1_v = (y1_n * avg_clip_w - float(pm[1, 3])) * inv_py
+
+    corners_v = np.array(
+        [[x0_v, y0_v, avg_z_v], [x1_v, y0_v, avg_z_v],
+         [x0_v, y1_v, avg_z_v], [x1_v, y1_v, avg_z_v]],
+        dtype=np.float32,
+    )
+    R_inv = R.T
+    t_inv = -(R_inv @ t)
+    corners_w = (R_inv @ corners_v.T).T + t_inv  # (4, 3) world space
+    quad_pos  = corners_w[[0, 1, 2, 1, 3, 2]]    # (6, 3) two CCW triangles
+
+    quad_verts = np.empty(6, dtype=_SLUG_FILL_DTYPE)
+    quad_verts["in_pos"]      = quad_pos
+    quad_verts["in_color"]    = color
+    quad_verts["curve_start"] = 0
+    quad_verts["n_curves"]    = n_quads
+    return quad_verts
 
 
 def _draw_vmobject_stroke(renderer: WebGPURenderer, vmobject: VMobject) -> None:

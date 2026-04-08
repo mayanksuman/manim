@@ -44,10 +44,12 @@ from manim.utils.space_ops import (
 )
 
 from .webgpu_vmobject_rendering import (
-    SLUG_FILL_VERTEX_LAYOUT,
+    FILL_STROKE_VERTEX_LAYOUT,
     STROKE_VERTEX_LAYOUT,
     SURFACE_VERTEX_LAYOUT,
-    render_webgpu_mobject,
+    _FrameData,
+    collect_frame_data,
+    draw_frame_data,
 )
 
 if TYPE_CHECKING:
@@ -466,14 +468,21 @@ class WebGPURenderer:
         self._depth_texture: wgpu_t.GPUTexture | None = None
         self._depth_texture_view: wgpu_t.GPUTextureView | None = None
         self._proj_bgl: wgpu_t.GPUBindGroupLayout | None = None
-        self._slug_bgl: wgpu_t.GPUBindGroupLayout | None = None
-        # Slug fill: 2-D (no depth) and 3-D (depth-tested, shade_in_3d with fill).
-        self._slug_fill_pipeline: wgpu_t.GPURenderPipeline | None = None
-        self._slug_fill_3d_pipeline: wgpu_t.GPURenderPipeline | None = None
-        # Stroke pipelines: 2-D, 3-D, and 3-D with depth bias (surface mesh lines).
-        self._stroke_pipeline: wgpu_t.GPURenderPipeline | None = None
-        self._stroke_3d_pipeline: wgpu_t.GPURenderPipeline | None = None
+
+        # Combined fill+stroke pipelines (vmobject_fill_stroke.wgsl).
+        # _fill_stroke_bgl is reused for both compute output and render input
+        # (camera uniform + read-only quads storage).
+        self._fill_stroke_bgl: wgpu_t.GPUBindGroupLayout | None = None
+        self._fill_stroke_pipeline: wgpu_t.GPURenderPipeline | None = None     # 2-D, no depth write
+        self._fill_stroke_3d_pipeline: wgpu_t.GPURenderPipeline | None = None  # 3-D, depth write
+
+        # Compute pipeline: cubic_to_quads.wgsl.
+        self._compute_bgl: wgpu_t.GPUBindGroupLayout | None = None
+        self._cubic_to_quads_pipeline: wgpu_t.GPUComputePipeline | None = None
+
+        # Surface mesh stroke (depth-biased cubic stroke pipeline).
         self._stroke_3d_surface_pipeline: wgpu_t.GPURenderPipeline | None = None
+
         # Surface pipelines: opaque (depth write + backface cull) and OIT.
         self._surface_pipeline: wgpu_t.GPURenderPipeline | None = None  # opaque
         self._surface_oit_pipeline: wgpu_t.GPURenderPipeline | None = None
@@ -556,8 +565,7 @@ class WebGPURenderer:
         self._depth_texture_view = self._depth_texture.create_view()
 
         self._proj_bgl = self._create_camera_bgl()
-        self._stroke_pipeline    = self._create_stroke_pipeline(self._proj_bgl, depth_test=True)
-        self._stroke_3d_pipeline = self._create_stroke_pipeline(self._proj_bgl, depth_test=True)
+
         # Surface mesh lines sit exactly on the surface triangles.  A negative
         # depth bias pulls each fragment slightly toward the camera so the mesh
         # always wins the depth test without visually offsetting the lines.
@@ -572,9 +580,18 @@ class WebGPURenderer:
             depth_bias_slope_scale=-1.0,
             depth_bias_clamp=0.00001,
         )
-        self._surface_pipeline            = self._create_surface_pipeline(self._proj_bgl, cull_mode="none",  depth_write=True)
-        self._slug_bgl, self._slug_fill_pipeline    = self._create_slug_fill_pipeline(depth_test=False)
-        _,              self._slug_fill_3d_pipeline = self._create_slug_fill_pipeline(depth_test=True)
+        self._surface_pipeline = self._create_surface_pipeline(self._proj_bgl, cull_mode="none", depth_write=True)
+
+        # Combined fill+stroke pipeline (replaces separate slug + stroke pipelines).
+        self._fill_stroke_bgl, self._fill_stroke_pipeline = \
+            self._create_fill_stroke_pipeline(depth_test=False)
+        _, self._fill_stroke_3d_pipeline = \
+            self._create_fill_stroke_pipeline(depth_test=True)
+
+        # GPU compute: cubic → quadratic conversion.
+        self._compute_bgl, self._cubic_to_quads_pipeline = \
+            self._create_cubic_to_quads_pipeline()
+
         self._create_oit_resources(width, height)
         self._create_readback_pipeline(width, height)
 
@@ -685,6 +702,123 @@ class WebGPURenderer:
                 "alpha_to_coverage_enabled": False,
             },
         )
+
+    def _create_fill_stroke_pipeline(
+        self,
+        depth_test: bool = False,
+    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
+        """Create the combined fill+stroke pipeline (vmobject_fill_stroke.wgsl).
+
+        The bind group layout mirrors the slug fill layout:
+          binding 0 — camera uniform (176 bytes)
+          binding 1 — quads storage buffer (read-only, output of compute shader)
+
+        depth_test=False — 2-D objects: depth-read-only (painter's algorithm).
+        depth_test=True  — 3-D objects: depth-write + depth-test.
+        """
+        assert self._device is not None
+        shader_path   = Path(__file__).parent / "shaders" / "vmobject_fill_stroke.wgsl"
+        shader_module = self._device.create_shader_module(
+            code=shader_path.read_text(encoding="utf-8")
+        )
+
+        bgl = self._device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "read-only-storage", "has_dynamic_offset": False},
+                },
+            ]
+        )
+
+        _blend = {
+            "color": {
+                "src_factor": "src-alpha",
+                "dst_factor": "one-minus-src-alpha",
+                "operation": "add",
+            },
+            "alpha": {
+                "src_factor": "one",
+                "dst_factor": "one",
+                "operation": "add",
+            },
+        }
+
+        pipeline = self._device.create_render_pipeline(
+            layout=self._device.create_pipeline_layout(bind_group_layouts=[bgl]),
+            vertex={
+                "module": shader_module,
+                "entry_point": "vs_main",
+                "buffers": [FILL_STROKE_VERTEX_LAYOUT],
+            },
+            fragment={
+                "module": shader_module,
+                "entry_point": "fs_main",
+                "targets": [{"format": wgpu.TextureFormat.bgra8unorm, "blend": _blend}],
+            },
+            primitive={"topology": "triangle-list", "cull_mode": "none"},
+            depth_stencil={
+                "format": wgpu.TextureFormat.depth24plus,
+                "depth_write_enabled": depth_test,
+                "depth_compare": "less",
+                "stencil_front": {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_back":  {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_read_mask": 0,
+                "stencil_write_mask": 0,
+            },
+            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
+        )
+        return bgl, pipeline
+
+    def _create_cubic_to_quads_pipeline(
+        self,
+    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPUComputePipeline]:
+        """Create the compute pipeline that converts cubics → quadratics.
+
+        Bind group layout:
+          binding 0 — input  cubics  (read-only-storage, 12 floats/cubic)
+          binding 1 — output quads   (storage read_write, 36 floats/cubic)
+          binding 2 — params uniform (n_cubics u32, padded to 16 bytes)
+
+        Dispatch: ceil(n_cubics / 64) × 1 × 1 workgroups.
+        """
+        assert self._device is not None
+        shader_path   = Path(__file__).parent / "shaders" / "cubic_to_quads.wgsl"
+        shader_module = self._device.create_shader_module(
+            code=shader_path.read_text(encoding="utf-8")
+        )
+
+        bgl = self._device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "read-only-storage"},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "storage"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "uniform"},
+                },
+            ]
+        )
+
+        pipeline = self._device.create_compute_pipeline(
+            layout=self._device.create_pipeline_layout(bind_group_layouts=[bgl]),
+            compute={"module": shader_module, "entry_point": "main"},
+        )
+        return bgl, pipeline
 
     def _create_surface_pipeline(
         self,
@@ -868,81 +1002,6 @@ class WebGPURenderer:
             ],
         )
 
-    def _create_slug_fill_pipeline(
-        self,
-        depth_test: bool = False,
-    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
-        """Create a Slug fill pipeline.
-
-        depth_test controls depth *writing* only — both 2-D and 3-D fills
-        always depth-test (depth_compare="less") so they are occluded by any
-        opaque surface rendered before them.
-
-        depth_test=False — 2-D fills: depth-read-only (default).
-        depth_test=True  — 3-D fills (shade_in_3d): depth-write + depth-test
-                           so they occlude geometry drawn behind them.
-        """
-        assert self._device is not None
-        shader_path = Path(__file__).parent / "shaders" / "slug_fill.wgsl"
-        shader_module = self._device.create_shader_module(
-            code=shader_path.read_text(encoding="utf-8")
-        )
-
-        # Group 0: binding 0 = camera uniform, binding 1 = curves storage (read-only).
-        slug_bgl = self._device.create_bind_group_layout(
-            entries=[
-                {
-                    "binding": 0,
-                    "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
-                    "buffer": {"type": "uniform"},
-                },
-                {
-                    "binding": 1,
-                    "visibility": wgpu.ShaderStage.FRAGMENT,
-                    "buffer": {"type": "read-only-storage", "has_dynamic_offset": False},
-                },
-            ]
-        )
-
-        _blend = {
-            "color": {
-                "src_factor": "src-alpha",
-                "dst_factor": "one-minus-src-alpha",
-                "operation": "add",
-            },
-            "alpha": {
-                "src_factor": "one",
-                "dst_factor": "one",
-                "operation": "add",
-            },
-        }
-
-        pipeline = self._device.create_render_pipeline(
-            layout=self._device.create_pipeline_layout(bind_group_layouts=[slug_bgl]),
-            vertex={
-                "module": shader_module,
-                "entry_point": "vs_main",
-                "buffers": [SLUG_FILL_VERTEX_LAYOUT],
-            },
-            fragment={
-                "module": shader_module,
-                "entry_point": "fs_main",
-                "targets": [{"format": wgpu.TextureFormat.bgra8unorm, "blend": _blend}],
-            },
-            primitive={"topology": "triangle-list", "cull_mode": "none"},
-            depth_stencil={
-                "format": wgpu.TextureFormat.depth24plus,
-                "depth_write_enabled": depth_test,
-                "depth_compare": "less",  # always depth-test; write only for 3-D fills
-                "stencil_front": {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
-                "stencil_back":  {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
-                "stencil_read_mask": 0,
-                "stencil_write_mask": 0,
-            },
-            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
-        )
-        return slug_bgl, pipeline
-
     # ------------------------------------------------------------------
     # Camera bind group (rebuilt each frame when projection changes)
     # ------------------------------------------------------------------
@@ -1047,23 +1106,6 @@ class WebGPURenderer:
 
         return normal_bg
 
-    def _build_slug_bind_group(
-        self, curves_buf: wgpu_t.GPUBuffer
-    ) -> wgpu_t.GPUBindGroup:
-        """Build the Slug fill bind group: camera uniform + curves storage buffer."""
-        assert self._device is not None
-        assert self._slug_bgl is not None
-        assert self._camera_uniform_buf is not None, (
-            "_build_camera_bind_group() must be called before _build_slug_bind_group()"
-        )
-        return self._device.create_bind_group(
-            layout=self._slug_bgl,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._camera_uniform_buf, "offset": 0, "size": 176}},
-                {"binding": 1, "resource": {"buffer": curves_buf, "offset": 0, "size": curves_buf.size}},
-            ],
-        )
-
     # ------------------------------------------------------------------
     # Pipeline / device accessors (used by webgpu_vmobject_rendering)
     # ------------------------------------------------------------------
@@ -1074,24 +1116,26 @@ class WebGPURenderer:
         return self._device
 
     @property
-    def stroke_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        assert self._stroke_pipeline is not None, "init_scene() has not been called"
-        return self._stroke_pipeline
+    def fill_stroke_pipeline(self) -> wgpu_t.GPURenderPipeline:
+        """Combined fill+stroke pipeline — 2-D (no depth write)."""
+        assert self._fill_stroke_pipeline is not None, "init_scene() has not been called"
+        return self._fill_stroke_pipeline
 
     @property
-    def stroke_3d_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        assert self._stroke_3d_pipeline is not None, "init_scene() has not been called"
-        return self._stroke_3d_pipeline
+    def fill_stroke_3d_pipeline(self) -> wgpu_t.GPURenderPipeline:
+        """Combined fill+stroke pipeline — 3-D (depth write + test)."""
+        assert self._fill_stroke_3d_pipeline is not None, "init_scene() has not been called"
+        return self._fill_stroke_3d_pipeline
 
     @property
     def stroke_3d_surface_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        """3-D stroke pipeline with depth bias — for surface mesh lines."""
+        """Cubic stroke pipeline with depth bias — for surface mesh lines."""
         assert self._stroke_3d_surface_pipeline is not None, "init_scene() has not been called"
         return self._stroke_3d_surface_pipeline
 
     @property
     def surface_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        """Opaque surface pipeline (cull_back, depth_write=True)."""
+        """Opaque surface pipeline (depth_write=True)."""
         assert self._surface_pipeline is not None, "init_scene() has not been called"
         return self._surface_pipeline
 
@@ -1099,16 +1143,6 @@ class WebGPURenderer:
     def surface_oit_pipeline(self) -> wgpu_t.GPURenderPipeline:
         assert self._surface_oit_pipeline is not None, "init_scene() has not been called"
         return self._surface_oit_pipeline
-
-    @property
-    def slug_fill_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        assert self._slug_fill_pipeline is not None, "init_scene() has not been called"
-        return self._slug_fill_pipeline
-
-    @property
-    def slug_fill_3d_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        assert self._slug_fill_3d_pipeline is not None, "init_scene() has not been called"
-        return self._slug_fill_3d_pipeline
 
     # ------------------------------------------------------------------
     # Frame rendering
@@ -1119,34 +1153,34 @@ class WebGPURenderer:
 
         Pass structure
         --------------
-        1. **Main pass** — clears the frame; draws normal slug fills, opaque
-           surfaces, strokes.  Fixed-orientation mobjects are drawn at the end
-           of this pass with a rotation-stripped camera bind group so they share
-           the same depth buffer as the rest of the scene.
-        2. **OIT accumulation pass** — if any normal surface has alpha < 0.99,
-           renders those fragments into two OIT accumulation textures (rgba16float)
-           with Weighted Blended blending.
-        3. **OIT composition pass** — full-screen triangle composites OIT result
-           onto the main texture.
-        4. **Fixed-in-frame overlay pass** — only if fixed-in-frame mobjects exist.
-           Loads existing colour, clears depth, and renders overlays with a
-           rotation-stripped orthographic camera so they always appear on top.
+        0. **Compute pass** — cubic_to_quads.wgsl converts raw cubic Bezier
+           control points to quadratic approximations for all three mobject
+           groups (normal, fixed-orientation, fixed-in-frame).  This runs
+           before any render pass in the same command encoder, so WebGPU's
+           implicit pass ordering provides the barrier.
+        1. **Main pass** — clears the frame; draws normal and fixed-orientation
+           mobjects (shared depth buffer; fixed-orient uses a rotation-stripped
+           camera bind group).
+        2. **OIT accumulation pass** — transparent surfaces use Weighted
+           Blended OIT into two rgba16float textures.
+        3. **OIT composition pass** — full-screen triangle composites the OIT
+           result onto the main texture.
+        4. **Fixed-in-frame overlay pass** — 2-D overlays rendered with a
+           fresh depth buffer so they always appear on top.
         """
         assert self._device is not None
         assert self._render_texture_view is not None
         assert self._depth_texture_view is not None
+        assert self._cubic_to_quads_pipeline is not None
 
         bg = self._background_color
 
-        # Build all three camera bind groups for this frame.
-        # camera_bind_group          — normal rotated view  (set on renderer for vmobject_rendering)
-        # fixed_camera_bind_group    — rotation-stripped, current projection (fixed-orientation)
-        # fixed_frame_bind_group     — rotation-stripped, ortho projection   (fixed-in-frame)
+        # Build all three per-frame camera uniform buffers + bind groups.
         self.camera_bind_group = self._build_camera_bind_group()
         self.frame_vbos = []
 
         # ── Partition mobjects ────────────────────────────────────────────
-        cam = self.camera
+        cam            = self.camera
         fixed_in_frame = cam._fixed_in_frame_mobjects
         fixed_orient   = cam._fixed_orientation_mobjects
 
@@ -1154,11 +1188,29 @@ class WebGPURenderer:
         fixed_orient_mobs = [m for m in scene.mobjects if m in fixed_orient]
         fixed_frame_mobs  = [m for m in scene.mobjects if m in fixed_in_frame]
 
+        # ── CPU tessellation + GPU buffer upload (no commands yet) ────────
+        assert self._camera_uniform_buf is not None
+        assert self._fixed_orient_uniform_buf is not None
+        assert self._fixed_frame_uniform_buf is not None
+
+        normal_fd       = collect_frame_data(self, normal_mobs,       self._camera_uniform_buf)
+        fixed_orient_fd = collect_frame_data(self, fixed_orient_mobs, self._fixed_orient_uniform_buf)
+        fixed_frame_fd  = collect_frame_data(self, fixed_frame_mobs,  self._fixed_frame_uniform_buf)
+
         encoder = self._device.create_command_encoder()
 
-        # ── Pass 1: main ──────────────────────────────────────────────────
-        # Renders normal mobjects and fixed-orientation mobjects (same depth
-        # buffer; fixed-orient uses the rotation-stripped bind group).
+        # ── Pass 0: compute — cubic → quadratic conversion ────────────────
+        # Runs before any render pass; WebGPU guarantees the output buffer is
+        # ready by the time the fragment shader reads it in Pass 1.
+        cp = encoder.begin_compute_pass()
+        cp.set_pipeline(self._cubic_to_quads_pipeline)
+        for fd in (normal_fd, fixed_orient_fd, fixed_frame_fd):
+            if fd is not None and fd.n_cubics_total > 0 and fd.compute_bg is not None:
+                cp.set_bind_group(0, fd.compute_bg, [], 0, 0)
+                cp.dispatch_workgroups((fd.n_cubics_total + 63) // 64, 1, 1)
+        cp.end()
+
+        # ── Pass 1: main render ───────────────────────────────────────────
         main_pass = encoder.begin_render_pass(
             color_attachments=[
                 {
@@ -1176,24 +1228,19 @@ class WebGPURenderer:
             },
         )
         self.current_render_pass = main_pass
-        oit_data = render_webgpu_mobject(self, normal_mobs)
 
-        # Fixed-orientation: same pass, swap to rotation-stripped bind group.
-        # The normal bind group and uniform buffer are saved and restored so
-        # the OIT accumulation pass (below) still uses the correct camera.
-        if fixed_orient_mobs:
-            _saved_bg  = self.camera_bind_group
-            _saved_buf = self._camera_uniform_buf
-            self.camera_bind_group  = self.fixed_camera_bind_group
-            self._camera_uniform_buf = self._fixed_orient_uniform_buf
-            render_webgpu_mobject(self, fixed_orient_mobs)
-            self.camera_bind_group  = _saved_bg
-            self._camera_uniform_buf = _saved_buf
+        if normal_fd is not None:
+            draw_frame_data(self, normal_fd, self.camera_bind_group)
+
+        if fixed_orient_fd is not None:
+            draw_frame_data(self, fixed_orient_fd, self.fixed_camera_bind_group)
 
         main_pass.end()
 
         # ── Pass 2: OIT accumulation ──────────────────────────────────────
-        if oit_data is not None:
+        # Uses the normal (rotated) camera bind group for the surface OIT pass.
+        oit_fd = normal_fd  # fixed-orient surfaces are uncommon; handle normally
+        if oit_fd is not None and oit_fd.oit_indices:
             oit_pass = encoder.begin_render_pass(
                 color_attachments=[
                     {
@@ -1211,17 +1258,17 @@ class WebGPURenderer:
                 ],
                 depth_stencil_attachment={
                     "view": self._depth_texture_view,
-                    "depth_load_op": "load",    # read depth from main pass
+                    "depth_load_op": "load",
                     "depth_store_op": "discard",
                 },
             )
             oit_pass.set_pipeline(self.surface_oit_pipeline)
             oit_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
-            for idx in oit_data.oit_indices:
-                arr = oit_data.surface_parts[idx]
+            for idx in oit_fd.oit_indices:
+                arr = oit_fd.surface_parts[idx]
                 oit_pass.set_vertex_buffer(
-                    0, oit_data.surface_buf,
-                    oit_data.byte_offsets[idx], arr.nbytes,
+                    0, oit_fd.surface_buf,
+                    oit_fd.surface_byte_offsets[idx], arr.nbytes,
                 )
                 oit_pass.draw(len(arr), 1, 0, 0)
             oit_pass.end()
@@ -1229,11 +1276,7 @@ class WebGPURenderer:
             # ── Pass 3: OIT composition ───────────────────────────────────
             compose_pass = encoder.begin_render_pass(
                 color_attachments=[
-                    {
-                        "view": self._render_texture_view,
-                        "load_op": "load",
-                        "store_op": "store",
-                    }
+                    {"view": self._render_texture_view, "load_op": "load", "store_op": "store"}
                 ],
             )
             compose_pass.set_pipeline(self._oit_compose_pipeline)
@@ -1241,31 +1284,23 @@ class WebGPURenderer:
             compose_pass.draw(3, 1, 0, 0)
             compose_pass.end()
 
-        # ── Fixed-in-frame overlay pass ───────────────────────────────────
-        # Rendered last, after OIT composition, so overlays always appear on
-        # top of the 3-D scene.  The depth buffer is cleared to 1.0 (far) and
-        # discarded afterward — fixed-in-frame objects only depth-test against
-        # each other, not against the main scene.
-        if fixed_frame_mobs:
+        # ── Pass 4: fixed-in-frame overlay ───────────────────────────────
+        # Rendered after OIT so overlays always appear on top of the 3-D scene.
+        # Fresh depth buffer: overlays only depth-test against each other.
+        if fixed_frame_fd is not None:
             fixed_pass = encoder.begin_render_pass(
                 color_attachments=[
-                    {
-                        "view": self._render_texture_view,
-                        "load_op": "load",   # preserve the composited 3-D scene
-                        "store_op": "store",
-                    }
+                    {"view": self._render_texture_view, "load_op": "load", "store_op": "store"}
                 ],
                 depth_stencil_attachment={
                     "view": self._depth_texture_view,
                     "depth_clear_value": 1.0,
-                    "depth_load_op": "clear",   # fresh depth — overlays on top
+                    "depth_load_op": "clear",
                     "depth_store_op": "discard",
                 },
             )
             self.current_render_pass = fixed_pass
-            self.camera_bind_group  = self.fixed_frame_bind_group
-            self._camera_uniform_buf = self._fixed_frame_uniform_buf
-            render_webgpu_mobject(self, fixed_frame_mobs)
+            draw_frame_data(self, fixed_frame_fd, self.fixed_frame_bind_group)
             fixed_pass.end()
 
         self._device.queue.submit([encoder.finish()])

@@ -21,10 +21,12 @@ list — strokes should follow the visible part of the curve only.
 
 Surfaces
 --------
-Parametric surfaces use a triangle-mesh pipeline (``surface.wgsl``) with
-Phong lighting.  Transparent surfaces go through the separate OIT
-accumulation + composition passes (``surface_oit.wgsl`` + ``oit_compose.wgsl``).
-Surface mesh grid lines use the old cubic-stroke pipeline with depth bias.
+Parametric surfaces use a combined triangle-mesh pipeline
+(``surface_combined.wgsl`` / ``surface_oit.wgsl``) with Phong lighting and
+barycentric wireframe in a single draw call.  The centroid vertex of each
+triangle fan carries bary=(1,0,0); the outer edge (anchor_i ↔ anchor_{i+1})
+has bary.x=0 — this is the visible mesh-grid edge.  Transparent surfaces go
+through the OIT accumulation + composition passes.
 
 Batching
 --------
@@ -53,65 +55,45 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Surface vertex layout — must match surface.wgsl locations
+# Combined surface vertex layout — must match surface_combined.wgsl /
+# surface_oit.wgsl locations.
+#
+#   location 0 — in_vert          float32x3  offset  0  (12 B)
+#   location 1 — in_normal        float32x3  offset 12  (12 B)
+#   location 2 — in_fill_color    float32x4  offset 24  (16 B)
+#   location 3 — in_stroke_color  float32x4  offset 40  (16 B)
+#   location 4 — in_bary          float32x3  offset 56  (12 B)
+#   location 5 — stroke_half_px   float32    offset 68  ( 4 B)
+#   stride: 72 bytes
 # ---------------------------------------------------------------------------
 
-_SURFACE_DTYPE = np.dtype(
+_SURFACE_COMBINED_DTYPE = np.dtype(
     [
-        ("in_vert",   np.float32, (3,)),
-        ("in_normal", np.float32, (3,)),
-        ("in_color",  np.float32, (4,)),
+        ("in_vert",         np.float32, (3,)),
+        ("in_normal",       np.float32, (3,)),
+        ("in_fill_color",   np.float32, (4,)),
+        ("in_stroke_color", np.float32, (4,)),
+        ("in_bary",         np.float32, (3,)),
+        ("stroke_half_px",  np.float32),
     ]
 )
-_SURFACE_STRIDE: int = _SURFACE_DTYPE.itemsize  # 40 bytes
+_SURFACE_COMBINED_STRIDE: int = _SURFACE_COMBINED_DTYPE.itemsize  # 72 bytes
 
-_SURFACE_OFFSETS: dict[str, int] = {
-    name: _SURFACE_DTYPE.fields[name][1]  # type: ignore[index]
-    for name in _SURFACE_DTYPE.names
+_SURFACE_COMBINED_OFFSETS: dict[str, int] = {
+    name: _SURFACE_COMBINED_DTYPE.fields[name][1]  # type: ignore[index]
+    for name in _SURFACE_COMBINED_DTYPE.names
 }
 
-SURFACE_VERTEX_LAYOUT: dict = {
-    "array_stride": _SURFACE_STRIDE,
+SURFACE_COMBINED_VERTEX_LAYOUT: dict = {
+    "array_stride": _SURFACE_COMBINED_STRIDE,
     "step_mode": "vertex",
     "attributes": [
-        {"format": "float32x3", "offset": _SURFACE_OFFSETS["in_vert"],   "shader_location": 0},
-        {"format": "float32x3", "offset": _SURFACE_OFFSETS["in_normal"], "shader_location": 1},
-        {"format": "float32x4", "offset": _SURFACE_OFFSETS["in_color"],  "shader_location": 2},
-    ],
-}
-
-
-# ---------------------------------------------------------------------------
-# Stroke vertex layout — used only for Surface mesh lines (stroke_surface).
-# Must match vmobject_stroke.wgsl locations.
-# ---------------------------------------------------------------------------
-
-_STROKE_DTYPE = np.dtype(
-    [
-        ("current_curve",   np.float32, (4, 3)),
-        ("tile_coordinate", np.float32, (2,)),
-        ("in_color",        np.float32, (4,)),
-        ("in_width",        np.float32),
-    ]
-)
-_STROKE_STRIDE: int = _STROKE_DTYPE.itemsize  # 76 bytes
-
-
-def _stroke_field_offset(name: str) -> int:
-    return _STROKE_DTYPE.fields[name][1]  # type: ignore[index]
-
-
-STROKE_VERTEX_LAYOUT: dict = {
-    "array_stride": _STROKE_STRIDE,
-    "step_mode": "vertex",
-    "attributes": [
-        {"format": "float32x3", "offset": _stroke_field_offset("current_curve"),      "shader_location": 0},
-        {"format": "float32x3", "offset": _stroke_field_offset("current_curve") + 12, "shader_location": 1},
-        {"format": "float32x3", "offset": _stroke_field_offset("current_curve") + 24, "shader_location": 2},
-        {"format": "float32x3", "offset": _stroke_field_offset("current_curve") + 36, "shader_location": 3},
-        {"format": "float32x2", "offset": _stroke_field_offset("tile_coordinate"),    "shader_location": 4},
-        {"format": "float32x4", "offset": _stroke_field_offset("in_color"),           "shader_location": 5},
-        {"format": "float32",   "offset": _stroke_field_offset("in_width"),           "shader_location": 6},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_vert"],         "shader_location": 0},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_normal"],       "shader_location": 1},
+        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_fill_color"],   "shader_location": 2},
+        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_stroke_color"], "shader_location": 3},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_bary"],         "shader_location": 4},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["stroke_half_px"],  "shader_location": 5},
     ],
 }
 
@@ -190,22 +172,16 @@ class _FrameData:
     compute_bg: wgpu_t.GPUBindGroup | None  # compute pass bind group
     render_bg: wgpu_t.GPUBindGroup | None   # fragment bind group (camera + quads)
 
-    # Parametric surfaces (unchanged pipeline)
+    # Parametric surfaces (combined fill + barycentric wireframe pipeline)
     surface_parts: list[np.ndarray]
     surface_buf: wgpu_t.GPUBuffer | None
     surface_byte_offsets: list[int]
-
-    # Surface mesh strokes (depth-biased cubic stroke pipeline)
-    stroke_surface_parts: list[np.ndarray]
-    stroke_surface_buf: wgpu_t.GPUBuffer | None
-    stroke_surface_byte_offsets: list[int]
 
     # Ordered draw commands:
     #   "fill_stroke_2d"  — 2-D VMobject (no depth write)
     #   "fill_stroke_3d"  — shade_in_3d VMobject (depth write + test)
     #   "surface_opaque"  — opaque parametric surface
     #   "surface_oit"     — transparent parametric surface (OIT pass, caller handles)
-    #   "stroke_surface"  — surface mesh grid lines (depth-biased)
     draw_plan: list[tuple[str, int]]
 
     # Indices into surface_parts that need OIT (handled by the caller).
@@ -221,10 +197,6 @@ class _FrameData:
 #   stroke_cubics: (M, 4, 3) float32 — no closing segments (visible curve only)
 # Geometry only; colors/widths are fetched fresh every frame.
 _fill_stroke_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-
-# _surface_stroke_cache: vmobject → (points_hash, stroke_data)
-# Used for surface mesh grid lines only (the old cubic-stroke pipeline).
-_surface_stroke_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _points_hash(vmobject: VMobject) -> int:
@@ -267,8 +239,7 @@ def collect_frame_data(
     n_fill_cubics_per:   list[int] = []       # Ni per draw call
     n_stroke_cubics_per: list[int] = []       # Mi per draw call
 
-    surface_parts:        list[np.ndarray] = []
-    stroke_surface_parts: list[np.ndarray] = []
+    surface_parts: list[np.ndarray] = []
     draw_plan: list[tuple[str, int]] = []
 
     for mob in mobjects:
@@ -278,25 +249,14 @@ def collect_frame_data(
         # ── Parametric Surface ────────────────────────────────────────────
         if isinstance(mob, Surface):
             for submob in mob.family_members_with_points():
-                data = _collect_surface_geometry(submob)
+                data = _collect_surface_geometry(
+                    submob, view_matrix, proj_matrix
+                )
                 if data is not None:
                     cls = _surface_opacity_class(data)
                     cmd = "surface_opaque" if cls == "opaque" else "surface_oit"
                     draw_plan.append((cmd, len(surface_parts)))
                     surface_parts.append(data)
-
-                # Surface mesh strokes (old cubic stroke pipeline).
-                phash   = _points_hash(submob)
-                scached = _surface_stroke_cache.get(submob)
-                if scached is not None and scached[0] == phash:
-                    draw_plan.append(("stroke_surface", len(stroke_surface_parts)))
-                    stroke_surface_parts.append(scached[1])
-                else:
-                    sdata = _collect_surface_stroke_geometry(submob)
-                    if sdata is not None:
-                        _surface_stroke_cache[submob] = (phash, sdata)
-                        draw_plan.append(("stroke_surface", len(stroke_surface_parts)))
-                        stroke_surface_parts.append(sdata)
             continue
 
         # ── Regular VMobject (2-D or shade_in_3d) ────────────────────────
@@ -436,17 +396,12 @@ def collect_frame_data(
             ],
         )
 
-    # ── Upload surface and surface-stroke data ───────────────────────────
+    # ── Upload surface data ──────────────────────────────────────────────
     surface_buf, surface_byte_offsets = None, []
     if surface_parts:
         _smooth_surface_normals(surface_parts)
         surface_buf, surface_byte_offsets = _batch_upload(device, surface_parts)
         renderer.frame_vbos.append(surface_buf)
-
-    stroke_surface_buf, stroke_surface_byte_offsets = None, []
-    if stroke_surface_parts:
-        stroke_surface_buf, stroke_surface_byte_offsets = _batch_upload(device, stroke_surface_parts)
-        renderer.frame_vbos.append(stroke_surface_buf)
 
     oit_indices = [idx for cmd, idx in draw_plan if cmd == "surface_oit"]
 
@@ -462,9 +417,6 @@ def collect_frame_data(
         surface_parts=surface_parts,
         surface_buf=surface_buf,
         surface_byte_offsets=surface_byte_offsets,
-        stroke_surface_parts=stroke_surface_parts,
-        stroke_surface_buf=stroke_surface_buf,
-        stroke_surface_byte_offsets=stroke_surface_byte_offsets,
         draw_plan=draw_plan,
         oit_indices=oit_indices,
     )
@@ -482,8 +434,7 @@ def draw_frame_data(
     1. 2-D fill+stroke objects — interleaved in ``draw_plan`` order (painter's
        algorithm; no depth write so objects paint over each other correctly).
     2. 3-D fill+stroke objects — depth write + test (shade_in_3d).
-    3. Opaque parametric surfaces — depth write.
-    4. Surface mesh strokes — depth-biased to avoid z-fighting.
+    3. Opaque parametric surfaces — depth write (includes barycentric wireframe).
 
     OIT surfaces are NOT drawn here; the caller reads ``fd.oit_indices`` and
     handles them in a separate accumulation pass.
@@ -501,8 +452,6 @@ def draw_frame_data(
                 rp.set_pipeline(renderer.fill_stroke_3d_pipeline)
             elif name == "surface_opaque":
                 rp.set_pipeline(renderer.surface_pipeline)
-            elif name == "stroke_surface":
-                rp.set_pipeline(renderer.stroke_3d_surface_pipeline)
             cur_pipeline[0] = name
         if cur_bg[0] is not bg:
             rp.set_bind_group(0, bg, [], 0, 0)
@@ -528,7 +477,7 @@ def draw_frame_data(
             rp.set_vertex_buffer(0, fd.fs_buf, fd.fs_byte_offsets[idx], arr.nbytes)
             rp.draw(len(arr), 1, 0, 0)
 
-    # 3. Opaque parametric surfaces.
+    # 3. Opaque parametric surfaces (combined fill + barycentric wireframe).
     if fd.surface_buf is not None:
         for cmd, idx in fd.draw_plan:
             if cmd != "surface_opaque":
@@ -536,19 +485,6 @@ def draw_frame_data(
             _activate("surface_opaque", cam_bg)
             arr = fd.surface_parts[idx]
             rp.set_vertex_buffer(0, fd.surface_buf, fd.surface_byte_offsets[idx], arr.nbytes)
-            rp.draw(len(arr), 1, 0, 0)
-
-    # 4. Surface mesh strokes (depth-biased).
-    if fd.stroke_surface_buf is not None:
-        for cmd, idx in fd.draw_plan:
-            if cmd != "stroke_surface":
-                continue
-            _activate("stroke_surface", cam_bg)
-            arr = fd.stroke_surface_parts[idx]
-            rp.set_vertex_buffer(
-                0, fd.stroke_surface_buf,
-                fd.stroke_surface_byte_offsets[idx], arr.nbytes,
-            )
             rp.draw(len(arr), 1, 0, 0)
 
 
@@ -758,21 +694,44 @@ def _build_fill_stroke_quad(
 
 
 def _surface_opacity_class(part: np.ndarray) -> str:
-    alphas = part["in_color"][:, 3]
+    alphas = part["in_fill_color"][:, 3]
     return "opaque" if float(alphas.min()) >= 0.99 else "oit"
 
 
-def _collect_surface_geometry(vmobject: VMobject) -> np.ndarray | None:
-    """Return a ``_SURFACE_DTYPE`` array for a shade_in_3d VMobject."""
+def _collect_surface_geometry(
+    vmobject: VMobject,
+    view_matrix: np.ndarray,
+    proj_matrix: np.ndarray,
+) -> np.ndarray | None:
+    """Return a ``_SURFACE_COMBINED_DTYPE`` array for a shade_in_3d VMobject.
+
+    Barycentric coordinates are assigned per triangle in the centroid fan:
+      centroid     → bary = (1, 0, 0)   (bary.x = 0 on outer edge)
+      anchor_i     → bary = (0, 1, 0)
+      anchor_{i+1} → bary = (0, 0, 1)
+
+    ``stroke_half_px`` is computed from the stroke width, projection matrix
+    and average clip-w of the surface anchors so that wireframe line width
+    is consistent across perspective depths.
+    """
+    from manim import config
+
     fill_rgba = vmobject.get_fill_rgbas()
     if fill_rgba.shape[0] == 0 or fill_rgba[0, 3] == 0:
         return None
 
-    color = fill_rgba[0].astype(np.float32)
+    fill_color   = fill_rgba[0].astype(np.float32)
+    stroke_rgba  = vmobject.get_stroke_rgbas()
+    stroke_color = (stroke_rgba[0].astype(np.float32)
+                    if stroke_rgba.shape[0] > 0
+                    else np.zeros(4, dtype=np.float32))
+    stroke_width = float(vmobject.get_stroke_width()) if stroke_rgba.shape[0] > 0 else 0.0
+
     nppcc = vmobject.n_points_per_cubic_curve
 
     all_verts:   list[np.ndarray] = []
     all_normals: list[np.ndarray] = []
+    all_bary:    list[np.ndarray] = []
 
     for subpath in vmobject.get_subpaths():
         n_curves = len(subpath) // nppcc
@@ -798,25 +757,52 @@ def _collect_surface_geometry(vmobject: VMobject) -> np.ndarray | None:
             else np.array([0.0, 0.0, 1.0], dtype=np.float32)
         )
 
+        # Triangle fan: (centroid, anchor_i, anchor_{i+1})
         fan_verts = np.empty((n_pts * 3, 3), dtype=np.float32)
         fan_verts[0::3] = centroid.astype(np.float32)
         fan_verts[1::3] = anchors.astype(np.float32)
         fan_verts[2::3] = np.roll(anchors, -1, axis=0).astype(np.float32)
 
+        # Barycentric coords: centroid=(1,0,0), anchor_i=(0,1,0), next=(0,0,1)
+        bary_block = np.zeros((n_pts * 3, 3), dtype=np.float32)
+        bary_block[0::3] = [1.0, 0.0, 0.0]
+        bary_block[1::3] = [0.0, 1.0, 0.0]
+        bary_block[2::3] = [0.0, 0.0, 1.0]
+
         all_verts.append(fan_verts)
         all_normals.append(np.tile(normal, (n_pts * 3, 1)))
+        all_bary.append(bary_block)
 
     if not all_verts:
         return None
 
     verts   = np.concatenate(all_verts,   axis=0)
     normals = np.concatenate(all_normals, axis=0)
+    bary    = np.concatenate(all_bary,    axis=0)
     n_total = len(verts)
 
-    attrs = np.empty(n_total, dtype=_SURFACE_DTYPE)
-    attrs["in_vert"]   = verts
-    attrs["in_normal"] = normals
-    attrs["in_color"]  = color
+    # Compute stroke_half_px: half the wireframe line width in screen pixels.
+    # Formula matches _build_fill_stroke_quad: 0.004 * width * |pm[0,0]| / |avg_clip_w|
+    # then multiplied by pixel_width/2 to convert NDC to pixels.
+    stroke_half_px = 0.0
+    if stroke_width > 0.0 and float(stroke_color[3]) > 0.001:
+        pm = proj_matrix.astype(np.float32)
+        vm = view_matrix.astype(np.float32)
+        R, t = vm[:3, :3], vm[:3, 3]
+        pts_v = (R @ verts.T).T + t         # (N, 3) view space
+        avg_z_v = float(pts_v[:, 2].mean())
+        avg_clip_w = float(pm[3, 2] * avg_z_v + pm[3, 3])
+        avg_clip_w = avg_clip_w if abs(avg_clip_w) > 1e-8 else 1.0
+        stroke_half_ndc = float(0.004 * stroke_width * abs(pm[0, 0]) / abs(avg_clip_w))
+        stroke_half_px  = stroke_half_ndc * config.pixel_width * 0.5
+
+    attrs = np.empty(n_total, dtype=_SURFACE_COMBINED_DTYPE)
+    attrs["in_vert"]         = verts
+    attrs["in_normal"]       = normals
+    attrs["in_fill_color"]   = fill_color
+    attrs["in_stroke_color"] = stroke_color
+    attrs["in_bary"]         = bary
+    attrs["stroke_half_px"]  = stroke_half_px
     return attrs
 
 
@@ -825,8 +811,8 @@ def _smooth_surface_normals(surface_parts: list[np.ndarray]) -> None:
     if not surface_parts:
         return
 
-    all_verts = np.concatenate([p["in_vert"]   for p in surface_parts], axis=0)
-    all_norms = np.concatenate([p["in_normal"] for p in surface_parts], axis=0)
+    all_verts = np.concatenate([p["in_vert"]    for p in surface_parts], axis=0)
+    all_norms = np.concatenate([p["in_normal"]  for p in surface_parts], axis=0)
 
     PREC = 1e-5
     quantized = np.round(all_verts.astype(np.float64) / PREC).astype(np.int64)
@@ -847,50 +833,3 @@ def _smooth_surface_normals(surface_parts: list[np.ndarray]) -> None:
         idx += n
 
 
-# ---------------------------------------------------------------------------
-# Surface mesh stroke collector (cubic stroke pipeline, surface only)
-# ---------------------------------------------------------------------------
-
-
-def _collect_surface_stroke_geometry(vmobject: VMobject) -> np.ndarray | None:
-    """Return a ``_STROKE_DTYPE`` array for a Surface sub-face stroke."""
-    stroke_rgba  = vmobject.get_stroke_rgbas()
-    stroke_width = float(vmobject.get_stroke_width())
-    if stroke_rgba.shape[0] == 0 or stroke_rgba[0, 3] == 0 or stroke_width == 0:
-        return None
-
-    color  = stroke_rgba[0].astype(np.float32)
-    nppcc  = vmobject.n_points_per_cubic_curve
-
-    curve_list: list[np.ndarray] = []
-    for subpath in vmobject.get_subpaths():
-        n_curves = len(subpath) // nppcc
-        if n_curves == 0:
-            continue
-        pts = subpath[: n_curves * nppcc]
-        b0s = pts[0::nppcc]
-        h0s = pts[1::nppcc]
-        h1s = pts[2::nppcc]
-        b3s = pts[3::nppcc]
-        curve_list.append(np.stack([b0s, h0s, h1s, b3s], axis=1))
-
-    if not curve_list:
-        return None
-
-    all_curves = np.concatenate(curve_list, axis=0).astype(np.float32)  # (N, 4, 3)
-    n_total    = len(all_curves)
-
-    base = np.zeros(n_total * 3, dtype=_STROKE_DTYPE)
-    base["current_curve"] = np.repeat(all_curves, 3, axis=0)
-    base["in_color"]      = color
-    base["in_width"]      = stroke_width
-
-    stroke_data = np.tile(base, 2)
-    n_half = n_total * 3
-    stroke_data["tile_coordinate"][:n_half] = np.tile(
-        [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0]], (n_total, 1)
-    )
-    stroke_data["tile_coordinate"][n_half:] = np.tile(
-        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], (n_total, 1)
-    )
-    return stroke_data

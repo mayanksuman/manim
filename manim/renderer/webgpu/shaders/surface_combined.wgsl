@@ -1,19 +1,28 @@
-// WebGPU OIT accumulation shader — Weighted Blended Order-Independent Transparency.
+// Combined opaque surface fill + barycentric wireframe shader.
 //
-// McGuire & Bavoil 2013.  Renders transparent surface fragments into two
-// accumulation targets instead of the main framebuffer:
+// One draw call per surface face renders both Phong-lit fill and mesh-grid
+// lines without a separate stroke pass.
 //
-//   location 0  accum   rgba16float   weighted colour + alpha sum
-//   location 1  reveal  rgba16float   per-channel transmittance product
+// Technique
+// ---------
+// Each triangle (centroid, anchor_i, anchor_{i+1}) in the centroid fan
+// carries barycentric coordinates:
+//   centroid     → bary = (1, 0, 0)   bary.x = 0 on the outer edge
+//   anchor_i     → bary = (0, 1, 0)
+//   anchor_{i+1} → bary = (0, 0, 1)
 //
-// The main pipeline blend modes for these targets are set to:
-//   accum:   {src: one,  dst: one}            — additive accumulation
-//   reveal:  {src: zero, dst: one-minus-src-alpha} — transmittance multiplication
+// bary.x is 0 on the "outer" edge (anchor_i ↔ anchor_{i+1}), which is the
+// visible mesh-grid edge.  The inner spoke edges (centroid ↔ anchor_*) have
+// bary.y = 0 or bary.z = 0 but are NOT rendered as wireframe.
 //
-// A subsequent full-screen composition pass reads both textures and composites
-// the result onto the opaque framebuffer.
+// fwidth(bary.x) gives the screen-space derivative of bary.x, so
+//   edge_dist_px = bary.x / fwidth(bary.x)
+// is approximately the distance from the outer edge in screen pixels.
+// A smooth SDF step at stroke_half_px produces anti-aliased grid lines.
 //
-// Vertex layout matches surface_combined.wgsl (stride 72 bytes):
+// Compositing: wireframe stroke "over" Phong fill (Porter-Duff).
+//
+// Vertex layout (must match _SURFACE_COMBINED_DTYPE, stride 72 bytes):
 //   location 0 — in_vert          float32x3  offset  0
 //   location 1 — in_normal        float32x3  offset 12
 //   location 2 — in_fill_color    float32x4  offset 24
@@ -69,24 +78,18 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-struct FragOutput {
-    @location(0) accum  : vec4<f32>,  // weighted colour sum   → rgba16float
-    @location(1) reveal : vec4<f32>,  // transmittance product → rgba16float
-};
-
 @fragment
-fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> FragOutput {
+fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     let diffuse_strength  = 0.9;
     let specular_strength = 0.8;
     let specular_exp      = 16.0;
 
-    // Two-sided lighting: flip normal for back-facing fragments.
-    let raw_normal  = select(-in.v_view_normal, in.v_view_normal, front_facing);
-    let norm        = normalize(raw_normal);
-    let light_dir_v = in.v_view_light - in.v_view_pos;
-    let light_dir   = normalize(light_dir_v);
-    let view_dir    = normalize(-in.v_view_pos);
-    let half_vec    = normalize(light_dir + view_dir);
+    let raw_normal   = select(-in.v_view_normal, in.v_view_normal, front_facing);
+    let norm         = normalize(raw_normal);
+    let light_dir_v  = in.v_view_light - in.v_view_pos;
+    let light_dir    = normalize(light_dir_v);
+    let view_dir     = normalize(-in.v_view_pos);
+    let half_vec     = normalize(light_dir + view_dir);
 
     let diff        = clamp(dot(norm, light_dir), 0.0, 1.0);
     let spec        = pow(max(dot(norm, half_vec), 0.0), specular_exp);
@@ -99,6 +102,8 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> FragO
     let fill_a       = in.v_fill_color.a;
 
     // ── Barycentric wireframe ──────────────────────────────────────────────
+    // bary.x is the barycentric weight of the centroid vertex, which equals 0
+    // on the outer (mesh-grid) edge.  fwidth converts bary.x to pixel units.
     let edge_dist_px = in.v_bary.x / max(fwidth(in.v_bary.x), 1e-6);
     let stroke_cov   = clamp(in.v_stroke_half + 0.5 - edge_dist_px, 0.0, 1.0);
     let stroke_a     = in.v_stroke_color.a * stroke_cov;
@@ -106,17 +111,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> FragO
     // ── Porter-Duff "over": stroke on top of fill ─────────────────────────
     let total_a = stroke_a + fill_a * (1.0 - stroke_a);
     if total_a <= 0.001 { discard; }
+
     let out_rgb = (stroke_a * in.v_stroke_color.rgb + fill_a * (1.0 - stroke_a) * lit_rgb) / total_a;
-
-    // ── Weighted Blended OIT ───────────────────────────────────────────────
-    let z = in.v_view_pos.z;
-    let w = clamp(
-        pow(total_a, 3.0) / (1e-5 + pow(abs(z) / 5.0, 4.0)),
-        1e-2, 3e3
-    );
-
-    var out: FragOutput;
-    out.accum  = vec4<f32>(out_rgb * total_a * w, total_a * w);
-    out.reveal = vec4<f32>(total_a, total_a, total_a, total_a);
-    return out;
+    return vec4<f32>(out_rgb, total_a);
 }

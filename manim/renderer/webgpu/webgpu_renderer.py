@@ -45,8 +45,7 @@ from manim.utils.space_ops import (
 
 from .webgpu_vmobject_rendering import (
     FILL_STROKE_VERTEX_LAYOUT,
-    STROKE_VERTEX_LAYOUT,
-    SURFACE_VERTEX_LAYOUT,
+    SURFACE_COMBINED_VERTEX_LAYOUT,
     _FrameData,
     collect_frame_data,
     draw_frame_data,
@@ -480,10 +479,7 @@ class WebGPURenderer:
         self._compute_bgl: wgpu_t.GPUBindGroupLayout | None = None
         self._cubic_to_quads_pipeline: wgpu_t.GPUComputePipeline | None = None
 
-        # Surface mesh stroke (depth-biased cubic stroke pipeline).
-        self._stroke_3d_surface_pipeline: wgpu_t.GPURenderPipeline | None = None
-
-        # Surface pipelines: opaque (depth write + backface cull) and OIT.
+        # Surface pipelines: opaque (depth write, combined fill+wireframe) and OIT.
         self._surface_pipeline: wgpu_t.GPURenderPipeline | None = None  # opaque
         self._surface_oit_pipeline: wgpu_t.GPURenderPipeline | None = None
         # OIT accumulation textures (rgba16float each).
@@ -573,13 +569,6 @@ class WebGPURenderer:
         # (depth24plus unit ≈ 6e-8), which is large enough to reliably beat
         # floating-point depth jitter on flat/low-slope surface regions where
         # depth_bias_slope_scale alone contributes nearly zero.
-        self._stroke_3d_surface_pipeline = self._create_stroke_pipeline(
-            self._proj_bgl,
-            depth_test=True,
-            depth_bias=-10000,
-            depth_bias_slope_scale=-1.0,
-            depth_bias_clamp=0.00001,
-        )
         self._surface_pipeline = self._create_surface_pipeline(self._proj_bgl, cull_mode="none", depth_write=True)
 
         # Combined fill+stroke pipeline (replaces separate slug + stroke pipelines).
@@ -627,81 +616,6 @@ class WebGPURenderer:
             ]
         )
 
-    def _create_stroke_pipeline(
-        self,
-        proj_bgl: wgpu_t.GPUBindGroupLayout,
-        depth_test: bool = False,
-        depth_bias: int = 0,
-        depth_bias_slope_scale: float = 0.0,
-        depth_bias_clamp: float = 0.0,
-    ) -> wgpu_t.GPURenderPipeline:
-        """Create a stroke pipeline.
-
-        depth_test controls depth *writing* only — both 2-D and 3-D strokes
-        always depth-test (depth_compare="less") so they are correctly occluded
-        by opaque geometry.
-
-        depth_test=False  — 2-D strokes: depth-read-only.  Occluded by any
-                            opaque surface in front of them, but do not themselves
-                            occlude later geometry.
-        depth_test=True   — 3-D strokes (shade_in_3d): depth-write + depth-test
-                            so they occlude geometry drawn behind them.
-        depth_bias / depth_bias_slope_scale / depth_bias_clamp
-                          — WebGPU depth bias applied to every fragment.  Use
-                            negative values to push geometry toward the camera,
-                            which prevents z-fighting when strokes lie exactly
-                            on a surface (e.g. Surface mesh lines).
-        """
-        assert self._device is not None
-        shader_path = Path(__file__).parent / "shaders" / "vmobject_stroke.wgsl"
-        shader_module = self._device.create_shader_module(
-            code=shader_path.read_text(encoding="utf-8")
-        )
-        _blend = {
-            "color": {
-                "src_factor": "src-alpha",
-                "dst_factor": "one-minus-src-alpha",
-                "operation": "add",
-            },
-            "alpha": {
-                "src_factor": "one",
-                "dst_factor": "one",
-                "operation": "add",
-            },
-        }
-        return self._device.create_render_pipeline(
-            layout=self._device.create_pipeline_layout(
-                bind_group_layouts=[proj_bgl]
-            ),
-            vertex={
-                "module": shader_module,
-                "entry_point": "vs_main",
-                "buffers": [STROKE_VERTEX_LAYOUT],
-            },
-            fragment={
-                "module": shader_module,
-                "entry_point": "fs_main",
-                "targets": [{"format": wgpu.TextureFormat.bgra8unorm, "blend": _blend}],
-            },
-            primitive={"topology": "triangle-list", "cull_mode": "none"},
-            depth_stencil={
-                "format": wgpu.TextureFormat.depth24plus,
-                "depth_write_enabled": depth_test,
-                "depth_compare": "less",  # always depth-test; write only for 3-D strokes
-                "depth_bias": depth_bias,
-                "depth_bias_slope_scale": depth_bias_slope_scale,
-                "depth_bias_clamp": depth_bias_clamp,
-                "stencil_front": {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
-                "stencil_back":  {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
-                "stencil_read_mask": 0,
-                "stencil_write_mask": 0,
-            },
-            multisample={
-                "count": 1,
-                "mask": 0xFFFF_FFFF,
-                "alpha_to_coverage_enabled": False,
-            },
-        )
 
     def _create_fill_stroke_pipeline(
         self,
@@ -839,7 +753,7 @@ class WebGPURenderer:
                       each other (they still depth-test against opaque geometry).
         """
         assert self._device is not None
-        shader_path = Path(__file__).parent / "shaders" / "surface.wgsl"
+        shader_path = Path(__file__).parent / "shaders" / "surface_combined.wgsl"
         shader_module = self._device.create_shader_module(
             code=shader_path.read_text(encoding="utf-8")
         )
@@ -862,7 +776,7 @@ class WebGPURenderer:
             vertex={
                 "module": shader_module,
                 "entry_point": "vs_main",
-                "buffers": [SURFACE_VERTEX_LAYOUT],
+                "buffers": [SURFACE_COMBINED_VERTEX_LAYOUT],
             },
             fragment={
                 "module": shader_module,
@@ -927,7 +841,7 @@ class WebGPURenderer:
             vertex={
                 "module": oit_shader,
                 "entry_point": "vs_main",
-                "buffers": [SURFACE_VERTEX_LAYOUT],
+                "buffers": [SURFACE_COMBINED_VERTEX_LAYOUT],
             },
             fragment={
                 "module": oit_shader,
@@ -1126,12 +1040,6 @@ class WebGPURenderer:
         """Combined fill+stroke pipeline — 3-D (depth write + test)."""
         assert self._fill_stroke_3d_pipeline is not None, "init_scene() has not been called"
         return self._fill_stroke_3d_pipeline
-
-    @property
-    def stroke_3d_surface_pipeline(self) -> wgpu_t.GPURenderPipeline:
-        """Cubic stroke pipeline with depth bias — for surface mesh lines."""
-        assert self._stroke_3d_surface_pipeline is not None, "init_scene() has not been called"
-        return self._stroke_3d_surface_pipeline
 
     @property
     def surface_pipeline(self) -> wgpu_t.GPURenderPipeline:

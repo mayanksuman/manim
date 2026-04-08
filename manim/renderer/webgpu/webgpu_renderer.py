@@ -927,7 +927,7 @@ class WebGPURenderer:
     ) -> wgpu_t.GPUBuffer:
         """Pack a 176-byte camera+lighting uniform buffer from explicit proj/view matrices.
 
-        Layout (matches Uniforms struct in surface.wgsl / surface_oit.wgsl):
+        Layout (matches Uniforms struct in surface_combined.wgsl / surface_oit.wgsl):
           offset   0 — projection        mat4x4<f32>  64 B
           offset  64 — view              mat4x4<f32>  64 B
           offset 128 — light_pos         vec3<f32>    12 B

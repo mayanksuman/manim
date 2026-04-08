@@ -1092,9 +1092,33 @@ class WebGPURenderer:
         fixed_in_frame = cam._fixed_in_frame_mobjects
         fixed_orient   = cam._fixed_orientation_mobjects
 
-        normal_mobs       = [m for m in scene.mobjects if m not in fixed_in_frame and m not in fixed_orient]
-        fixed_orient_mobs = [m for m in scene.mobjects if m in fixed_orient]
-        fixed_frame_mobs  = [m for m in scene.mobjects if m in fixed_in_frame]
+        # Expand non-VMobject containers (e.g. Group) to their VMobject children.
+        # This handles the case where scene.add(Group(vmobject)) causes
+        # restructure_mobjects to replace the vmobject in scene.mobjects with the
+        # Group wrapper, which is not a VMobject and would otherwise be skipped.
+        def _flatten_to_vmobjects(mob_list: list) -> list:
+            result: list = []
+            seen: set[int] = set()
+
+            def _add(mob: Any) -> None:
+                if id(mob) in seen:
+                    return
+                seen.add(id(mob))
+                if isinstance(mob, VMobject):
+                    result.append(mob)
+                else:
+                    for sub in mob.submobjects:
+                        _add(sub)
+
+            for mob in mob_list:
+                _add(mob)
+            return result
+
+        scene_mobs = _flatten_to_vmobjects(list(scene.mobjects))
+
+        normal_mobs       = [m for m in scene_mobs if m not in fixed_in_frame and m not in fixed_orient]
+        fixed_orient_mobs = [m for m in scene_mobs if m in fixed_orient]
+        fixed_frame_mobs  = [m for m in scene_mobs if m in fixed_in_frame]
 
         # ── CPU tessellation + GPU buffer upload (no commands yet) ────────
         assert self._camera_uniform_buf is not None

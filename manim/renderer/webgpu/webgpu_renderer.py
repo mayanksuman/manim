@@ -439,8 +439,19 @@ class WebGPURenderer:
         self.camera: WebGPUCamera = WebGPUCamera()
         self.window: WebGPUWindow | None = None
         self.pressed_keys: set[int] = set()
-        self.static_image: Any = None
+        self._static_image: Any = None
         self.file_writer: SceneFileWriter | None = None  # set by init_scene()
+
+        # Static-frame compositing (WP1).
+        # save_static_frame_data() renders static mobjects once into
+        # _static_texture; update_frame() blits it as the background and only
+        # re-draws the moving subset each animation frame.
+        self._static_texture: wgpu_t.GPUTexture | None = None
+        self._static_texture_view: wgpu_t.GPUTextureView | None = None
+        self._has_static_frame: bool = False
+        # IDs (id()) of the top-level mobjects that belong to the static layer.
+        # Used in render() to partition scene.mobjects into static vs dynamic.
+        self._static_mob_ids: set[int] = set()
 
         # SpecialThreeDScene reads renderer.camera_config["pixel_width"] to decide
         # whether to apply low-quality overrides.  Mirrors the pattern used by
@@ -515,6 +526,21 @@ class WebGPURenderer:
         self.frame_vbos: list[wgpu_t.GPUBuffer] = []
 
     # ------------------------------------------------------------------
+    # static_image property — scene.py sets this to None at end of play()
+    # ------------------------------------------------------------------
+
+    @property
+    def static_image(self) -> Any:
+        return self._static_image
+
+    @static_image.setter
+    def static_image(self, value: Any) -> None:
+        self._static_image = value
+        if value is None:
+            self._has_static_frame = False
+            self._static_mob_ids = set()
+
+    # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
 
@@ -548,10 +574,24 @@ class WebGPURenderer:
             usage=(
                 wgpu.TextureUsage.RENDER_ATTACHMENT
                 | wgpu.TextureUsage.COPY_SRC
+                | wgpu.TextureUsage.COPY_DST        # receives blit from _static_texture
                 | wgpu.TextureUsage.TEXTURE_BINDING  # read by compact-readback compute shader
             ),
         )
         self._render_texture_view = self._render_texture.create_view()
+
+        # Static-frame texture: stores the pre-rendered static layer.
+        # Populated once per animation by save_static_frame_data(); blitted
+        # back into _render_texture each frame by update_frame(blit_static=True).
+        self._static_texture = self._device.create_texture(
+            size=(width, height, 1),
+            format=wgpu.TextureFormat.bgra8unorm,
+            usage=(
+                wgpu.TextureUsage.COPY_DST  # written by copy from _render_texture
+                | wgpu.TextureUsage.COPY_SRC  # read back into _render_texture each frame
+            ),
+        )
+        self._static_texture_view = self._static_texture.create_view()
 
         self._depth_texture = self._device.create_texture(
             size=(width, height, 1),
@@ -1056,24 +1096,44 @@ class WebGPURenderer:
     # Frame rendering
     # ------------------------------------------------------------------
 
-    def update_frame(self, scene: Scene) -> None:
+    def update_frame(
+        self,
+        scene: Scene,
+        mob_list: list | None = None,
+        blit_static: bool = False,
+    ) -> None:
         """Render one frame into the offscreen texture.
+
+        Parameters
+        ----------
+        mob_list:
+            When provided, render only these top-level mobjects instead of
+            all of ``scene.mobjects``.  Used by ``save_static_frame_data``
+            (static subset) and by ``render`` (moving subset).
+        blit_static:
+            When True, blit ``_static_texture`` → ``_render_texture`` before
+            the main render pass so the static background is preserved.  The
+            main pass then uses ``load_op="load"`` to composite moving mobs
+            on top.  If False (the default), the frame is cleared to the
+            background colour first.
 
         Pass structure
         --------------
-        0. **Compute pass** — cubic_to_quads.wgsl converts raw cubic Bezier
+        0. **Texture blit** (when *blit_static*) — copies the pre-rendered
+           static layer into the render texture before any render passes.
+        1. **Compute pass** — cubic_to_quads.wgsl converts raw cubic Bezier
            control points to quadratic approximations for all three mobject
            groups (normal, fixed-orientation, fixed-in-frame).  This runs
            before any render pass in the same command encoder, so WebGPU's
            implicit pass ordering provides the barrier.
-        1. **Main pass** — clears the frame; draws normal and fixed-orientation
-           mobjects (shared depth buffer; fixed-orient uses a rotation-stripped
-           camera bind group).
-        2. **OIT accumulation pass** — transparent surfaces use Weighted
+        2. **Main pass** — clears (or loads) the frame; draws normal and
+           fixed-orientation mobjects (shared depth buffer; fixed-orient uses
+           a rotation-stripped camera bind group).
+        3. **OIT accumulation pass** — transparent surfaces use Weighted
            Blended OIT into two rgba16float textures.
-        3. **OIT composition pass** — full-screen triangle composites the OIT
+        4. **OIT composition pass** — full-screen triangle composites the OIT
            result onto the main texture.
-        4. **Fixed-in-frame overlay pass** — 2-D overlays rendered with a
+        5. **Fixed-in-frame overlay pass** — 2-D overlays rendered with a
            fresh depth buffer so they always appear on top.
         """
         assert self._device is not None
@@ -1096,7 +1156,7 @@ class WebGPURenderer:
         # This handles the case where scene.add(Group(vmobject)) causes
         # restructure_mobjects to replace the vmobject in scene.mobjects with the
         # Group wrapper, which is not a VMobject and would otherwise be skipped.
-        def _flatten_to_vmobjects(mob_list: list) -> list:
+        def _flatten_to_vmobjects(source: list) -> list:
             result: list = []
             seen: set[int] = set()
 
@@ -1110,11 +1170,12 @@ class WebGPURenderer:
                     for sub in mob.submobjects:
                         _add(sub)
 
-            for mob in mob_list:
+            for mob in source:
                 _add(mob)
             return result
 
-        scene_mobs = _flatten_to_vmobjects(list(scene.mobjects))
+        source = mob_list if mob_list is not None else list(scene.mobjects)
+        scene_mobs = _flatten_to_vmobjects(source)
 
         normal_mobs       = [m for m in scene_mobs if m not in fixed_in_frame and m not in fixed_orient]
         fixed_orient_mobs = [m for m in scene_mobs if m in fixed_orient]
@@ -1125,11 +1186,38 @@ class WebGPURenderer:
         assert self._fixed_orient_uniform_buf is not None
         assert self._fixed_frame_uniform_buf is not None
 
-        normal_fd       = collect_frame_data(self, normal_mobs,       self._camera_uniform_buf)
-        fixed_orient_fd = collect_frame_data(self, fixed_orient_mobs, self._fixed_orient_uniform_buf)
-        fixed_frame_fd  = collect_frame_data(self, fixed_frame_mobs,  self._fixed_frame_uniform_buf)
+        normal_fd = collect_frame_data(self, normal_mobs, self._camera_uniform_buf)
+
+        # Fixed-orientation: identity rotation, same projection as scene.
+        # Pass the stripped view matrix so CPU bounding quads are computed in the
+        # same space as the GPU will rasterise them.
+        fixed_view = self.camera.fixed_view_matrix
+        fixed_orient_fd = collect_frame_data(
+            self, fixed_orient_mobs, self._fixed_orient_uniform_buf,
+            view_matrix_override=fixed_view,
+        )
+
+        # Fixed-in-frame: identity rotation + orthographic projection.
+        # Both overrides are needed so the CPU quad positions match the GPU output.
+        fixed_frame_fd = collect_frame_data(
+            self, fixed_frame_mobs, self._fixed_frame_uniform_buf,
+            view_matrix_override=fixed_view,
+            proj_matrix_override=self.camera.ortho_projection_matrix,
+        )
 
         encoder = self._device.create_command_encoder()
+
+        # ── Pre-pass: blit static background ─────────────────────────────
+        # When compositing moving mobs on top of the pre-rendered static layer,
+        # copy the static texture into the render texture before any render
+        # passes.  The subsequent main pass uses load_op="load" so the static
+        # pixels are preserved under the newly drawn moving mobs.
+        if blit_static and self._has_static_frame and self._static_texture is not None:
+            encoder.copy_texture_to_texture(
+                {"texture": self._static_texture, "mip_level": 0, "origin": (0, 0, 0)},
+                {"texture": self._render_texture, "mip_level": 0, "origin": (0, 0, 0)},
+                (config.pixel_width, config.pixel_height, 1),
+            )
 
         # ── Pass 0: compute — cubic → quadratic conversion ────────────────
         # Runs before any render pass; WebGPU guarantees the output buffer is
@@ -1143,11 +1231,17 @@ class WebGPURenderer:
         cp.end()
 
         # ── Pass 1: main render ───────────────────────────────────────────
+        # When blit_static, the render texture already has the static background
+        # from the pre-pass blit, so we use load_op="load" to preserve it.
+        # The depth buffer is always cleared: moving mobs composite on top
+        # regardless of their world-space depth relative to static objects,
+        # which matches Cairo's static-image compositing behaviour.
+        color_load_op = "load" if blit_static else "clear"
         main_pass = encoder.begin_render_pass(
             color_attachments=[
                 {
                     "view": self._render_texture_view,
-                    "load_op": "clear",
+                    "load_op": color_load_op,
                     "store_op": "store",
                     "clear_value": tuple(float(c) for c in bg),
                 }
@@ -1447,7 +1541,14 @@ class WebGPURenderer:
     # ------------------------------------------------------------------
 
     def render(self, scene: Scene, frame_offset: float, moving_mobjects: list) -> None:
-        self.update_frame(scene)
+        if self._has_static_frame:
+            # Composite only the moving top-level mobjects on top of the
+            # pre-rendered static background.  We derive the "top-level moving"
+            # set by excluding the static mob IDs from scene.mobjects.
+            top_moving = [m for m in scene.mobjects if id(m) not in self._static_mob_ids]
+            self.update_frame(scene, mob_list=top_moving, blit_static=True)
+        else:
+            self.update_frame(scene)
         if self.skip_animations:
             return
         self.file_writer.write_frame(self)
@@ -1456,7 +1557,11 @@ class WebGPURenderer:
             while self.animation_elapsed_time < frame_offset:
                 if self.window.is_closing:
                     break
-                self.update_frame(scene)
+                if self._has_static_frame:
+                    top_moving = [m for m in scene.mobjects if id(m) not in self._static_mob_ids]
+                    self.update_frame(scene, mob_list=top_moving, blit_static=True)
+                else:
+                    self.update_frame(scene)
                 self.window.present()
 
     def play(self, scene: Scene, *animations: Any, **kwargs: Any) -> None:
@@ -1492,6 +1597,10 @@ class WebGPURenderer:
         self.file_writer.begin_animation(not self.skip_animations)
         scene.begin_animations()
 
+        # Pre-render static mobjects once, matching Cairo's optimisation.
+        # scene.static_mobjects is populated by begin_animations() above.
+        self.save_static_frame_data(scene, scene.static_mobjects)
+
         if scene.is_current_animation_frozen_frame():
             self.update_frame(scene)
             if not self.skip_animations:
@@ -1525,7 +1634,42 @@ class WebGPURenderer:
             self.file_writer.save_image(self.get_image())
 
     def save_static_frame_data(self, scene: Scene, static_mobjects: Any) -> None:
-        pass  # not implemented in Phase 1
+        """Render *static_mobjects* once and cache the result in ``_static_texture``.
+
+        Called by ``play()`` after ``begin_animations()``, before the per-frame
+        loop starts.  Subsequent calls to ``render()`` blit this cached texture
+        as the background and only re-draw the moving subset, matching Cairo's
+        static-image compositing optimisation.
+
+        When *static_mobjects* is empty (all mobs are moving, or no mobs at all),
+        the static frame is cleared so that ``render()`` falls back to a full
+        redraw each frame.
+        """
+        assert self._device is not None
+        assert self._static_texture is not None
+
+        static_list = list(static_mobjects) if static_mobjects else []
+
+        if not static_list:
+            self._has_static_frame = False
+            self._static_mob_ids = set()
+            return
+
+        self._static_mob_ids = set(id(m) for m in static_list)
+
+        # Render the static mob list into _render_texture (full clear + draw).
+        self.update_frame(scene, mob_list=static_list, blit_static=False)
+
+        # Copy _render_texture → _static_texture for later per-frame blits.
+        encoder = self._device.create_command_encoder()
+        encoder.copy_texture_to_texture(
+            {"texture": self._render_texture, "mip_level": 0, "origin": (0, 0, 0)},
+            {"texture": self._static_texture, "mip_level": 0, "origin": (0, 0, 0)},
+            (config.pixel_width, config.pixel_height, 1),
+        )
+        self._device.queue.submit([encoder.finish()])
+
+        self._has_static_frame = True
 
     def clear_screen(self) -> None:
         if self.window is not None:

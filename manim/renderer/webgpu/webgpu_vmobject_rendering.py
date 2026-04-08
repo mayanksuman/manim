@@ -215,6 +215,8 @@ def collect_frame_data(
     renderer: WebGPURenderer,
     mobjects: list,
     camera_uniform_buf: wgpu_t.GPUBuffer,
+    view_matrix_override: np.ndarray | None = None,
+    proj_matrix_override: np.ndarray | None = None,
 ) -> _FrameData | None:
     """Tessellate *mobjects*, upload to GPU, return a ``_FrameData``.
 
@@ -225,11 +227,25 @@ def collect_frame_data(
     *camera_uniform_buf* is the 176-byte uniform buffer for this camera group.
     It is stored in the render bind group so the fragment shader can project
     world-space curve data into the correct NDC space.
+
+    *view_matrix_override* / *proj_matrix_override* replace the camera's normal
+    view and projection matrices for CPU-side bounding-quad computation.  Use
+    these for fixed-in-frame and fixed-orientation mobjects so that the
+    world-space quad vertices are consistent with the bind group the GPU will
+    use to rasterise them.
     """
     import wgpu
 
-    view_matrix: np.ndarray = renderer.camera.view_matrix
-    proj_matrix: np.ndarray = renderer.camera.projection_matrix
+    view_matrix: np.ndarray = (
+        view_matrix_override
+        if view_matrix_override is not None
+        else renderer.camera.view_matrix
+    )
+    proj_matrix: np.ndarray = (
+        proj_matrix_override
+        if proj_matrix_override is not None
+        else renderer.camera.projection_matrix
+    )
 
     # Per-draw-call data collected across all mobjects.
     fs_parts: list[np.ndarray] = []

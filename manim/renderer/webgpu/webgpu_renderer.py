@@ -49,7 +49,10 @@ from manim.utils.space_ops import (
 from .webgpu_vmobject_rendering import (
     FILL_STROKE_VERTEX_LAYOUT,
     SURFACE_COMBINED_VERTEX_LAYOUT,
+    TRUE_DOT_VERTEX_LAYOUT,
+    DotCloud3D,
     _FrameData,
+    build_true_dot_vbo,
     collect_frame_data,
     draw_frame_data,
 )
@@ -543,6 +546,10 @@ class WebGPURenderer:
         self._oit_compose_bgl: wgpu_t.GPUBindGroupLayout | None = None
         self._oit_compose_bind_group: wgpu_t.GPUBindGroup | None = None
 
+        # TrueDot pipeline (true_dot.wgsl) — renders DotCloud3D/PointDot as
+        # screen-aligned lit sphere quads (CPU-expanded, 6 verts per dot).
+        self._true_dot_pipeline: wgpu_t.GPURenderPipeline | None = None
+
         # Image pipeline (image.wgsl) — renders ImageMobject pixel arrays as
         # textured quads before the VMobject pass (painter's algorithm).
         self._image_pipeline: wgpu_t.GPURenderPipeline | None = None
@@ -677,6 +684,7 @@ class WebGPURenderer:
         self._create_oit_resources(width, height)
         self._create_readback_pipeline(width, height)
         self._image_tex_bgl, self._image_pipeline = self._create_image_pipeline()
+        self._true_dot_pipeline = self._create_true_dot_pipeline(self._proj_bgl)
 
         # Persistent camera uniform buffers — created once, updated each frame via
         # write_buffer.  Using COPY_DST so queue.write_buffer can write into them.
@@ -922,6 +930,58 @@ class WebGPURenderer:
                 "mask": 0xFFFF_FFFF,
                 "alpha_to_coverage_enabled": False,
             },
+        )
+
+    def _create_true_dot_pipeline(
+        self,
+        proj_bgl: wgpu_t.GPUBindGroupLayout,
+    ) -> wgpu_t.GPURenderPipeline:
+        """Create the TrueDot pipeline (true_dot.wgsl).
+
+        Reuses the camera bind group layout (``proj_bgl``) at group 0.
+        Depth write is enabled so dots occlude each other and other geometry.
+        Alpha blending is on so the anti-aliased disc edge fades smoothly.
+        """
+        assert self._device is not None
+        shader_path = Path(__file__).parent / "shaders" / "true_dot.wgsl"
+        shader = self._device.create_shader_module(
+            code=shader_path.read_text(encoding="utf-8")
+        )
+        _blend = {
+            "color": {
+                "src_factor": "src-alpha",
+                "dst_factor": "one-minus-src-alpha",
+                "operation": "add",
+            },
+            "alpha": {
+                "src_factor": "one",
+                "dst_factor": "one",
+                "operation": "add",
+            },
+        }
+        return self._device.create_render_pipeline(
+            layout=self._device.create_pipeline_layout(bind_group_layouts=[proj_bgl]),
+            vertex={
+                "module": shader,
+                "entry_point": "vs_main",
+                "buffers": [TRUE_DOT_VERTEX_LAYOUT],
+            },
+            fragment={
+                "module": shader,
+                "entry_point": "fs_main",
+                "targets": [{"format": wgpu.TextureFormat.bgra8unorm, "blend": _blend}],
+            },
+            primitive={"topology": "triangle-list", "cull_mode": "none"},
+            depth_stencil={
+                "format": wgpu.TextureFormat.depth24plus,
+                "depth_write_enabled": True,
+                "depth_compare": "less",
+                "stencil_front": {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_back":  {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_read_mask": 0,
+                "stencil_write_mask": 0,
+            },
+            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
         )
 
     def _create_image_pipeline(
@@ -1549,6 +1609,10 @@ class WebGPURenderer:
             if isinstance(mob, AbstractImageMobject):
                 _flush_runs()
                 render_queue.append(("image", mob))
+            elif isinstance(mob, DotCloud3D):
+                # WebGPU dot cloud — rendered as screen-aligned sphere quads.
+                _flush_runs()
+                render_queue.append(("truedot", mob))
             elif isinstance(mob, VMobject):
                 if mob in fixed_in_frame:
                     pass  # handled in the overlay pass below
@@ -1567,6 +1631,7 @@ class WebGPURenderer:
         # Pre-fetch image GPU resources (texture upload, VBO) before the
         # command encoder starts.  Replace ('image', mob) queue items with
         # ('image', vbo, tex_bg) so the render loop has no CPU work left.
+        # Similarly expand TrueDot mobs into vertex arrays and GPU buffers.
         resolved_queue: list[tuple] = []
         for item in render_queue:
             if item[0] == "image":
@@ -1575,6 +1640,16 @@ class WebGPURenderer:
                 resources = self._get_image_gpu_resources(mob)
                 if vbo is not None and resources is not None:
                     resolved_queue.append(("image", vbo, resources[1]))
+            elif item[0] == "truedot":
+                mob = item[1]
+                arr = build_true_dot_vbo(mob)
+                if arr is not None and len(arr) > 0:
+                    buf = self._device.create_buffer_with_data(
+                        data=arr.tobytes(),
+                        usage=wgpu.BufferUsage.VERTEX,
+                    )
+                    self.frame_vbos.append(buf)
+                    resolved_queue.append(("truedot", buf, len(arr)))
             else:
                 resolved_queue.append(item)
 
@@ -1678,6 +1753,12 @@ class WebGPURenderer:
                 main_pass.set_bind_group(1, tex_bg, [], 0, 0)
                 main_pass.set_vertex_buffer(0, vbo)
                 main_pass.draw(6)
+            elif item[0] == "truedot":
+                _, buf, n_verts = item
+                main_pass.set_pipeline(self._true_dot_pipeline)
+                main_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
+                main_pass.set_vertex_buffer(0, buf)
+                main_pass.draw(n_verts)
             elif item[0] == "vmobs":
                 _, fd, cam_bg = item
                 draw_frame_data(self, fd, cam_bg)

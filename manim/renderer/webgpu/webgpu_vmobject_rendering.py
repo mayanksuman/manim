@@ -41,10 +41,11 @@ from __future__ import annotations
 import struct
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from manim.mobject.three_d.dot_cloud import DotCloud3D
 from manim.mobject.three_d.three_dimensions import Surface
 from manim.mobject.types.vectorized_mobject import VMobject
 
@@ -145,6 +146,114 @@ FILL_STROKE_VERTEX_LAYOUT: dict = {
         {"format": "uint32",    "offset": _FILL_STROKE_OFFSETS["n_stroke_curves"],    "shader_location": 7},
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# TrueDot vertex layout — must match true_dot.wgsl locations.
+#
+#   location 0 — center  float32x3  offset  0  (12 B)
+#   location 1 — color   float32x4  offset 12  (16 B)
+#   location 2 — uv      float32x2  offset 28  ( 8 B)
+#   location 3 — radius  float32    offset 36  ( 4 B)
+#   location 4 — gloss   float32    offset 40  ( 4 B)
+#   location 5 — shadow  float32    offset 44  ( 4 B)
+#   stride: 48 bytes
+# ---------------------------------------------------------------------------
+
+_TRUE_DOT_DTYPE = np.dtype(
+    [
+        ("center", np.float32, (3,)),
+        ("color",  np.float32, (4,)),
+        ("uv",     np.float32, (2,)),
+        ("radius", np.float32),
+        ("gloss",  np.float32),
+        ("shadow", np.float32),
+    ]
+)
+_TRUE_DOT_STRIDE: int = _TRUE_DOT_DTYPE.itemsize  # 48 bytes
+
+_TRUE_DOT_OFFSETS: dict[str, int] = {
+    name: _TRUE_DOT_DTYPE.fields[name][1]  # type: ignore[index]
+    for name in _TRUE_DOT_DTYPE.names
+}
+
+TRUE_DOT_VERTEX_LAYOUT: dict = {
+    "array_stride": _TRUE_DOT_STRIDE,
+    "step_mode": "vertex",
+    "attributes": [
+        {"format": "float32x3", "offset": _TRUE_DOT_OFFSETS["center"], "shader_location": 0},
+        {"format": "float32x4", "offset": _TRUE_DOT_OFFSETS["color"],  "shader_location": 1},
+        {"format": "float32x2", "offset": _TRUE_DOT_OFFSETS["uv"],     "shader_location": 2},
+        {"format": "float32",   "offset": _TRUE_DOT_OFFSETS["radius"], "shader_location": 3},
+        {"format": "float32",   "offset": _TRUE_DOT_OFFSETS["gloss"],  "shader_location": 4},
+        {"format": "float32",   "offset": _TRUE_DOT_OFFSETS["shadow"], "shader_location": 5},
+    ],
+}
+
+# Corner UV offsets for the two triangles that form a screen-aligned quad:
+#   triangle 0: (BL, BR, TL)  → corners 0,1,2
+#   triangle 1: (BR, TR, TL)  → corners 1,3,2
+# x_sign: -1 +1 -1 +1   y_sign: -1 -1 +1 +1
+_QUAD_UVS = np.array(
+    [
+        [-1.0, -1.0],  # BL (0)
+        [ 1.0, -1.0],  # BR (1)
+        [-1.0,  1.0],  # TL (2)
+        [ 1.0, -1.0],  # BR (1)  ← repeated for 2nd triangle
+        [ 1.0,  1.0],  # TR (3)
+        [-1.0,  1.0],  # TL (2)  ← repeated
+    ],
+    dtype=np.float32,
+)  # shape (6, 2)
+
+def build_true_dot_vbo(
+    mob: DotCloud3D,
+) -> np.ndarray | None:
+    """Expand a ``DotCloud3D`` into a flat vertex array for TrueDot rendering.
+
+    Each point becomes 6 vertices (2 triangles) forming a screen-aligned quad.
+    UV coords span (−1,−1) → (1,1); the radius is in world-space scene units.
+
+    Returns ``None`` if the mob has no renderable points.
+    """
+    pts   = mob.get_cloud_points()
+    rgbas = mob.get_rgbas()
+    radius = mob.dot_radius
+    gloss  = mob.gloss
+    shadow = mob.shadow
+
+    pts = np.asarray(pts, dtype=np.float32)  # (N, 3)
+    N = len(pts)
+    if N == 0:
+        return None
+
+    # Broadcast rgbas to (N, 4).
+    if rgbas is None or len(rgbas) == 0:
+        rgba = np.ones((N, 4), dtype=np.float32)
+    else:
+        rgbas = np.asarray(rgbas, dtype=np.float32)
+        if len(rgbas) == 1:
+            rgba = np.repeat(rgbas[:1], N, axis=0)
+        elif len(rgbas) < N:
+            # Resize with interpolation (matches OpenGL behaviour).
+            indices = np.round(np.linspace(0, len(rgbas) - 1, N)).astype(int)
+            rgba = rgbas[indices]
+        else:
+            rgba = rgbas[:N]
+
+    # Expand N points → N×6 vertices.
+    pts_rep  = np.repeat(pts,  6, axis=0)   # (N*6, 3)
+    rgba_rep = np.repeat(rgba, 6, axis=0)   # (N*6, 4)
+    uvs      = np.tile(_QUAD_UVS, (N, 1))   # (N*6, 2)
+
+    arr = np.zeros(N * 6, dtype=_TRUE_DOT_DTYPE)
+    arr["center"] = pts_rep
+    arr["color"]  = rgba_rep
+    arr["uv"]     = uvs
+    arr["radius"] = radius
+    arr["gloss"]  = gloss
+    arr["shadow"] = shadow
+    return arr
 
 
 # ---------------------------------------------------------------------------

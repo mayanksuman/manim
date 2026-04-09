@@ -70,15 +70,17 @@ if TYPE_CHECKING:
 
 _SURFACE_COMBINED_DTYPE = np.dtype(
     [
-        ("in_vert",         np.float32, (3,)),
-        ("in_normal",       np.float32, (3,)),
-        ("in_fill_color",   np.float32, (4,)),
-        ("in_stroke_color", np.float32, (4,)),
-        ("in_bary",         np.float32, (3,)),
-        ("stroke_half_px",  np.float32),
+        ("in_vert",           np.float32, (3,)),
+        ("in_normal",         np.float32, (3,)),
+        ("in_fill_color",     np.float32, (4,)),
+        ("in_stroke_color",   np.float32, (4,)),
+        ("in_bary",           np.float32, (3,)),
+        ("stroke_half_px",    np.float32),
+        ("diffuse_strength",  np.float32),
+        ("specular_strength", np.float32),
     ]
 )
-_SURFACE_COMBINED_STRIDE: int = _SURFACE_COMBINED_DTYPE.itemsize  # 72 bytes
+_SURFACE_COMBINED_STRIDE: int = _SURFACE_COMBINED_DTYPE.itemsize  # 80 bytes
 
 _SURFACE_COMBINED_OFFSETS: dict[str, int] = {
     name: _SURFACE_COMBINED_DTYPE.fields[name][1]  # type: ignore[index]
@@ -89,12 +91,14 @@ SURFACE_COMBINED_VERTEX_LAYOUT: dict = {
     "array_stride": _SURFACE_COMBINED_STRIDE,
     "step_mode": "vertex",
     "attributes": [
-        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_vert"],         "shader_location": 0},
-        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_normal"],       "shader_location": 1},
-        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_fill_color"],   "shader_location": 2},
-        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_stroke_color"], "shader_location": 3},
-        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_bary"],         "shader_location": 4},
-        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["stroke_half_px"],  "shader_location": 5},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_vert"],           "shader_location": 0},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_normal"],         "shader_location": 1},
+        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_fill_color"],     "shader_location": 2},
+        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_stroke_color"],   "shader_location": 3},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_bary"],           "shader_location": 4},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["stroke_half_px"],    "shader_location": 5},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["diffuse_strength"],  "shader_location": 6},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["specular_strength"], "shader_location": 7},
     ],
 }
 
@@ -1119,13 +1123,18 @@ def _collect_surface_geometry(
         stroke_half_ndc = float(0.004 * stroke_width * abs(pm[0, 0]) / abs(avg_clip_w))
         stroke_half_px  = stroke_half_ndc * config.pixel_width * 0.5
 
+    diffuse_strength  = float(getattr(vmobject, "diffuse_strength",  0.8))
+    specular_strength = float(getattr(vmobject, "specular_strength", 0.9))
+
     attrs = np.empty(n_total, dtype=_SURFACE_COMBINED_DTYPE)
-    attrs["in_vert"]         = verts
-    attrs["in_normal"]       = normals
-    attrs["in_fill_color"]   = fill_color
-    attrs["in_stroke_color"] = stroke_color
-    attrs["in_bary"]         = bary
-    attrs["stroke_half_px"]  = stroke_half_px
+    attrs["in_vert"]           = verts
+    attrs["in_normal"]         = normals
+    attrs["in_fill_color"]     = fill_color
+    attrs["in_stroke_color"]   = stroke_color
+    attrs["in_bary"]           = bary
+    attrs["stroke_half_px"]    = stroke_half_px
+    attrs["diffuse_strength"]  = diffuse_strength
+    attrs["specular_strength"] = specular_strength
     return attrs
 
 

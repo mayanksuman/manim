@@ -88,6 +88,14 @@ class Surface(VGroup, metaclass=ConvertToOpenGL):
     should_make_jagged
         Changes the anchor mode of the Bézier curves from smooth to jagged.
         Defaults to ``False``.
+    diffuse_strength
+        Strength of the diffuse (Lambertian) lighting component, in [0, 1].
+        Defaults to 0.8.
+        **WebGPU renderer only** — ignored by the Cairo and OpenGL renderers.
+    specular_strength
+        Strength of the specular (Phong) highlight, in [0, ∞].
+        Defaults to 0.9.
+        **WebGPU renderer only** — ignored by the Cairo and OpenGL renderers.
 
     Examples
     --------
@@ -127,10 +135,14 @@ class Surface(VGroup, metaclass=ConvertToOpenGL):
         stroke_width: float = 0.5,
         should_make_jagged: bool = False,
         pre_function_handle_to_anchor_scale_factor: float = 0.00001,
+        diffuse_strength: float = 0.8,
+        specular_strength: float = 0.9,
         **kwargs: Any,
     ) -> None:
         self.u_range = u_range
         self.v_range = v_range
+        self.diffuse_strength = diffuse_strength
+        self.specular_strength = specular_strength
         super().__init__(
             fill_color=fill_color,
             fill_opacity=fill_opacity,

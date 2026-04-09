@@ -13,13 +13,15 @@
 // A subsequent full-screen composition pass reads both textures and composites
 // the result onto the opaque framebuffer.
 //
-// Vertex layout matches surface_combined.wgsl (stride 72 bytes):
-//   location 0 — in_vert          float32x3  offset  0
-//   location 1 — in_normal        float32x3  offset 12
-//   location 2 — in_fill_color    float32x4  offset 24
-//   location 3 — in_stroke_color  float32x4  offset 40
-//   location 4 — in_bary          float32x3  offset 56
-//   location 5 — stroke_half_px   float32    offset 68
+// Vertex layout matches surface_combined.wgsl (stride 80 bytes):
+//   location 0 — in_vert           float32x3  offset  0
+//   location 1 — in_normal         float32x3  offset 12
+//   location 2 — in_fill_color     float32x4  offset 24
+//   location 3 — in_stroke_color   float32x4  offset 40
+//   location 4 — in_bary           float32x3  offset 56
+//   location 5 — stroke_half_px    float32    offset 68
+//   location 6 — diffuse_strength  float32    offset 72
+//   location 7 — specular_strength float32    offset 76
 
 struct Uniforms {
     projection        : mat4x4<f32>,
@@ -34,12 +36,14 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> u : Uniforms;
 
 struct VertexInput {
-    @location(0) in_vert         : vec3<f32>,
-    @location(1) in_normal       : vec3<f32>,
-    @location(2) in_fill_color   : vec4<f32>,
-    @location(3) in_stroke_color : vec4<f32>,
-    @location(4) in_bary         : vec3<f32>,
-    @location(5) stroke_half_px  : f32,
+    @location(0) in_vert           : vec3<f32>,
+    @location(1) in_normal         : vec3<f32>,
+    @location(2) in_fill_color     : vec4<f32>,
+    @location(3) in_stroke_color   : vec4<f32>,
+    @location(4) in_bary           : vec3<f32>,
+    @location(5) stroke_half_px    : f32,
+    @location(6) diffuse_strength  : f32,
+    @location(7) specular_strength : f32,
 };
 
 struct VertexOutput {
@@ -51,6 +55,8 @@ struct VertexOutput {
     @location(4)                    v_view_light   : vec3<f32>,
     @location(5)                    v_bary         : vec3<f32>,
     @location(6) @interpolate(flat) v_stroke_half  : f32,
+    @location(7) @interpolate(flat) v_diffuse      : f32,
+    @location(8) @interpolate(flat) v_specular     : f32,
 };
 
 @vertex
@@ -66,6 +72,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.v_stroke_color = in.in_stroke_color;
     out.v_bary         = in.in_bary;
     out.v_stroke_half  = in.stroke_half_px;
+    out.v_diffuse      = in.diffuse_strength;
+    out.v_specular     = in.specular_strength;
     return out;
 }
 
@@ -76,8 +84,8 @@ struct FragOutput {
 
 @fragment
 fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> FragOutput {
-    let diffuse_strength  = 0.9;
-    let specular_strength = 0.8;
+    let diffuse_strength  = in.v_diffuse;
+    let specular_strength = in.v_specular;
     let specular_exp      = 16.0;
 
     // Two-sided lighting: flip normal for back-facing fragments.

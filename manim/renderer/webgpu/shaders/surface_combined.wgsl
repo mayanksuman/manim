@@ -80,8 +80,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
-    let diffuse_strength  = 0.9;
-    let specular_strength = 0.8;
+    let diffuse_strength  = 0.8;
+    let specular_strength = 0.9;
     let specular_exp      = 16.0;
 
     let raw_normal   = select(-in.v_view_normal, in.v_view_normal, front_facing);

@@ -211,12 +211,50 @@ def _points_hash(vmobject: VMobject) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _fd_fingerprint(
+    mobjects: list,
+    view_matrix: np.ndarray,
+    proj_matrix: np.ndarray,
+    center_view_matrix: np.ndarray | None = None,
+) -> bytes:
+    """Compute a compact fingerprint of the mobject set + camera state.
+
+    Captures: view/projection matrices, per-submobject geometry hash, fill
+    color, stroke color, and stroke width.  Two frames with identical
+    fingerprints are guaranteed to produce pixel-identical renders.
+
+    *center_view_matrix* — when provided (fixed-orientation path), it is
+    included in the fingerprint so that camera rotation invalidates the cache
+    even though *view_matrix* (the stripped fixed_view) is constant.
+
+    Cost: O(n) over all leaf submobjects, but only does scalar reads and bytes
+    operations — no numpy matrix math or buffer allocations.  Much cheaper
+    than a full tessellation pass.
+    """
+    parts: list[bytes] = [view_matrix.tobytes(), proj_matrix.tobytes()]
+    if center_view_matrix is not None:
+        parts.append(center_view_matrix.tobytes())
+    for mob in mobjects:
+        for submob in mob.family_members_with_points():
+            phash = _points_hash(submob)
+            fill_rgba   = submob.get_fill_rgbas()
+            stroke_rgba = submob.get_stroke_rgbas()
+            sw = float(submob.get_stroke_width()) if stroke_rgba.shape[0] > 0 else 0.0
+            parts.append(struct.pack('<q', phash))
+            parts.append(fill_rgba.tobytes())
+            parts.append(stroke_rgba.tobytes())
+            parts.append(struct.pack('<f', sw))
+    return b''.join(parts)
+
+
 def collect_frame_data(
     renderer: WebGPURenderer,
     mobjects: list,
     camera_uniform_buf: wgpu_t.GPUBuffer,
     view_matrix_override: np.ndarray | None = None,
     proj_matrix_override: np.ndarray | None = None,
+    center_view_matrix: np.ndarray | None = None,
+    cache_slot: str | None = None,
 ) -> _FrameData | None:
     """Tessellate *mobjects*, upload to GPU, return a ``_FrameData``.
 
@@ -233,6 +271,21 @@ def collect_frame_data(
     these for fixed-in-frame and fixed-orientation mobjects so that the
     world-space quad vertices are consistent with the bind group the GPU will
     use to rasterise them.
+
+    *center_view_matrix* — when provided, enables fixed-orientation rendering.
+    Each submobject's bezier control points are pre-translated by
+    ``(R_full - I) @ center_w`` so the object appears at the 3D-projected
+    position of its world center while its local orientation stays upright
+    (no camera rotation applied to the local shape).  The GPU shader still
+    uses *view_matrix_override* (typically the rotation-stripped fixed_view),
+    and the pre-translation makes the combined effect equivalent to Cairo's
+    ``transform_points_pre_display`` for fixed-orientation objects.
+
+    *cache_slot* — when not None, enables ``_FrameData`` caching for this
+    call.  On a fingerprint hit the cached ``_FrameData`` is returned
+    immediately, skipping all tessellation and GPU buffer uploads.  The
+    ``camera_uniform_buf`` must be a *persistent* buffer (same Python object
+    across frames) so that cached ``render_bg`` bind groups remain valid.
     """
     import wgpu
 
@@ -247,6 +300,19 @@ def collect_frame_data(
         else renderer.camera.projection_matrix
     )
 
+    # ── _FrameData cache check ────────────────────────────────────────────
+    fp: bytes = b""  # populated below on cache-enabled paths
+    if cache_slot is not None and mobjects:
+        fp = _fd_fingerprint(mobjects, view_matrix, proj_matrix, center_view_matrix)
+        cached = renderer._fd_cache.get(cache_slot)
+        if cached is not None and cached[0] == fp:
+            # Scene + camera unchanged — return the cached GPU data directly.
+            # The compute pass will re-dispatch into the same quads_out_buf
+            # (safe: identical input → identical output; the render pass reads
+            # it after the compute pass completes within the same encoder).
+            return cached[1]
+        # Cache miss — tessellate below, then store result before returning.
+
     # Per-draw-call data collected across all mobjects.
     fs_parts: list[np.ndarray] = []
     # Cubics: fill first (all objects), then stroke (all objects).
@@ -258,13 +324,28 @@ def collect_frame_data(
     surface_parts: list[np.ndarray] = []
     draw_plan: list[tuple[str, int]] = []
 
+    # Guard against double-processing the same submobject.  This can happen
+    # when mob_list is a flat family list (e.g. moving_mobjects from
+    # begin_animations) that contains both a VGroup and its children: without
+    # the guard, family_members_with_points() on the VGroup would process the
+    # children, and then those children would be processed again individually.
+    _seen_submobs: set[int] = set()
+
+    use_z_index: bool = renderer.camera.use_z_index
+
     for mob in mobjects:
         if not isinstance(mob, VMobject):
             continue
 
         # ── Parametric Surface ────────────────────────────────────────────
         if isinstance(mob, Surface):
-            for submob in mob.family_members_with_points():
+            surface_submobs = mob.family_members_with_points()
+            if use_z_index:
+                surface_submobs = sorted(surface_submobs, key=lambda m: m.z_index)
+            for submob in surface_submobs:
+                if id(submob) in _seen_submobs:
+                    continue
+                _seen_submobs.add(id(submob))
                 data = _collect_surface_geometry(
                     submob, view_matrix, proj_matrix
                 )
@@ -276,7 +357,13 @@ def collect_frame_data(
             continue
 
         # ── Regular VMobject (2-D or shade_in_3d) ────────────────────────
-        for submob in mob.family_members_with_points():
+        vmob_submobs = mob.family_members_with_points()
+        if use_z_index:
+            vmob_submobs = sorted(vmob_submobs, key=lambda m: m.z_index)
+        for submob in vmob_submobs:
+            if id(submob) in _seen_submobs:
+                continue
+            _seen_submobs.add(id(submob))
             phash  = _points_hash(submob)
             cached = _fill_stroke_cache.get(submob)
             if cached is None or cached[0] != phash:
@@ -290,6 +377,31 @@ def collect_frame_data(
             if cached is None:
                 continue
             fill_cubics, stroke_cubics = cached[1]
+
+            # Fixed-orientation pre-transform: translate control points so the
+            # submob appears at its full 3D-projected center position while
+            # preserving local orientation (no rotation of the local shape).
+            #
+            # Cairo's equivalent: transform_points_pre_display() computes
+            #   new_center = project_point(center)   (full camera rotation)
+            #   points     = points + (new_center - center)
+            # i.e. translate all points by the difference between the
+            # camera-space center and the world-space center.
+            #
+            # In WebGPU, with t_full == t_fixed == [0,0,-11], the offset
+            # simplifies to:
+            #   offset = R_full @ center_w - center_w  = (R_full - I) @ center_w
+            # After adding this offset, the GPU shader applies fixed_view
+            # (identity rotation + z-translation), giving:
+            #   view_pos = (point_w + offset) + [0,0,-11]
+            #            = (point_w - center_w) + (R_full @ center_w + [0,0,-11])
+            # which is the local shape centred at the full-projection center. ✓
+            if center_view_matrix is not None:
+                R_full = center_view_matrix[:3, :3].astype(np.float32)
+                c_w = submob.get_center().astype(np.float32)
+                offset = R_full @ c_w - c_w          # shape (3,)
+                fill_cubics   = fill_cubics   + offset  # broadcast (N,4,3)+(3,)
+                stroke_cubics = stroke_cubics + offset
 
             # Fetch current colors every frame (they change during animations).
             fill_rgba   = submob.get_fill_rgbas()
@@ -421,7 +533,7 @@ def collect_frame_data(
 
     oit_indices = [idx for cmd, idx in draw_plan if cmd == "surface_oit"]
 
-    return _FrameData(
+    result = _FrameData(
         fs_parts=fs_parts,
         fs_buf=fs_buf,
         fs_byte_offsets=fs_byte_offsets,
@@ -436,6 +548,24 @@ def collect_frame_data(
         draw_plan=draw_plan,
         oit_indices=oit_indices,
     )
+
+    # Store in cache so the NEXT frame can skip tessellation on a fingerprint hit.
+    # frame_vbos are NOT added for cached buffers — the cache itself is the owner.
+    # Remove the just-uploaded buffers from frame_vbos so they aren't released at
+    # end-of-frame (the cache needs them to survive across frames).
+    if cache_slot is not None:
+        cached_bufs = {
+            id(result.fs_buf),
+            id(result.cubics_buf),
+            id(result.quads_out_buf),
+            id(result.surface_buf),
+        } - {id(None)}
+        renderer.frame_vbos = [
+            b for b in renderer.frame_vbos if id(b) not in cached_bufs
+        ]
+        renderer._fd_cache[cache_slot] = (fp, result)
+
+    return result
 
 
 def draw_frame_data(
@@ -457,51 +587,119 @@ def draw_frame_data(
     """
     rp = renderer.current_render_pass
 
-    cur_pipeline: list[str | None]      = [None]
-    cur_bg:       list[object | None]   = [None]
-
-    def _activate(name: str, bg: wgpu_t.GPUBindGroup) -> None:
-        if cur_pipeline[0] != name:
-            if name == "fill_stroke_2d":
-                rp.set_pipeline(renderer.fill_stroke_pipeline)
-            elif name == "fill_stroke_3d":
-                rp.set_pipeline(renderer.fill_stroke_3d_pipeline)
-            elif name == "surface_opaque":
-                rp.set_pipeline(renderer.surface_pipeline)
-            cur_pipeline[0] = name
-        if cur_bg[0] is not bg:
-            rp.set_bind_group(0, bg, [], 0, 0)
-            cur_bg[0] = bg
-
-    # 1. 2-D fill+stroke: interleaved in draw_plan order (painter's algorithm).
+    # ── 1. 2-D fill+stroke: painter's algorithm ───────────────────────────
+    # All 2-D quads live in fs_buf in their original draw_plan order.
+    # Instead of N separate set_vertex_buffer+draw calls we issue one draw
+    # per *contiguous run* of "fill_stroke_2d" entries, dramatically reducing
+    # the number of wgpu API calls (typically from 800 to 1 for a pure-2D scene).
     if fd.fs_buf is not None and fd.render_bg is not None:
+        rp.set_pipeline(renderer.fill_stroke_pipeline)
+        rp.set_bind_group(0, fd.render_bg, [], 0, 0)
+        rp.set_vertex_buffer(0, fd.fs_buf)
+
+        # Walk draw_plan and batch consecutive fill_stroke_2d entries.
+        run_first_vertex: int = -1
+        run_vertex_count: int = 0
+
         for cmd, idx in fd.draw_plan:
             if cmd != "fill_stroke_2d":
+                # Flush the current 2D run (if any) before breaking the batch.
+                if run_vertex_count > 0:
+                    rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                    run_vertex_count = 0
+                    run_first_vertex = -1
                 continue
-            _activate("fill_stroke_2d", fd.render_bg)
-            arr = fd.fs_parts[idx]
-            rp.set_vertex_buffer(0, fd.fs_buf, fd.fs_byte_offsets[idx], arr.nbytes)
-            rp.draw(len(arr), 1, 0, 0)
 
-    # 2. 3-D fill+stroke: depth-tested and depth-written.
+            arr         = fd.fs_parts[idx]
+            byte_offset = fd.fs_byte_offsets[idx]
+            first_vert  = byte_offset // _FILL_STROKE_STRIDE
+
+            if run_first_vertex < 0:
+                # Start a new run.
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+            elif first_vert == run_first_vertex + run_vertex_count:
+                # Extend the current contiguous run.
+                run_vertex_count += len(arr)
+            else:
+                # Gap in the buffer (shouldn't happen for pure-2D scenes but
+                # guard anyway).  Flush old run, start new one.
+                rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+
+        # Flush final run.
+        if run_vertex_count > 0:
+            rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+
+    # ── 2. 3-D fill+stroke: depth-tested and depth-written ────────────────
+    # Same batching strategy for shade_in_3d VMobjects.
     if fd.fs_buf is not None and fd.render_bg is not None:
+        rp.set_pipeline(renderer.fill_stroke_3d_pipeline)
+        rp.set_bind_group(0, fd.render_bg, [], 0, 0)
+        rp.set_vertex_buffer(0, fd.fs_buf)
+
+        run_first_vertex = -1
+        run_vertex_count = 0
+
         for cmd, idx in fd.draw_plan:
             if cmd != "fill_stroke_3d":
+                if run_vertex_count > 0:
+                    rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                    run_vertex_count = 0
+                    run_first_vertex = -1
                 continue
-            _activate("fill_stroke_3d", fd.render_bg)
-            arr = fd.fs_parts[idx]
-            rp.set_vertex_buffer(0, fd.fs_buf, fd.fs_byte_offsets[idx], arr.nbytes)
-            rp.draw(len(arr), 1, 0, 0)
 
-    # 3. Opaque parametric surfaces (combined fill + barycentric wireframe).
+            arr         = fd.fs_parts[idx]
+            byte_offset = fd.fs_byte_offsets[idx]
+            first_vert  = byte_offset // _FILL_STROKE_STRIDE
+
+            if run_first_vertex < 0:
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+            elif first_vert == run_first_vertex + run_vertex_count:
+                run_vertex_count += len(arr)
+            else:
+                rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+
+        if run_vertex_count > 0:
+            rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+
+    # ── 3. Opaque parametric surfaces ─────────────────────────────────────
     if fd.surface_buf is not None:
+        rp.set_pipeline(renderer.surface_pipeline)
+        rp.set_bind_group(0, cam_bg, [], 0, 0)
+        rp.set_vertex_buffer(0, fd.surface_buf)
+
+        run_first_vertex = -1
+        run_vertex_count = 0
+
         for cmd, idx in fd.draw_plan:
             if cmd != "surface_opaque":
+                if run_vertex_count > 0:
+                    rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                    run_vertex_count = 0
+                    run_first_vertex = -1
                 continue
-            _activate("surface_opaque", cam_bg)
-            arr = fd.surface_parts[idx]
-            rp.set_vertex_buffer(0, fd.surface_buf, fd.surface_byte_offsets[idx], arr.nbytes)
-            rp.draw(len(arr), 1, 0, 0)
+
+            arr         = fd.surface_parts[idx]
+            byte_offset = fd.surface_byte_offsets[idx]
+            first_vert  = byte_offset // _SURFACE_COMBINED_STRIDE
+
+            if run_first_vertex < 0:
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+            elif first_vert == run_first_vertex + run_vertex_count:
+                run_vertex_count += len(arr)
+            else:
+                rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+
+        if run_vertex_count > 0:
+            rp.draw(run_vertex_count, 1, run_first_vertex, 0)
 
 
 # ---------------------------------------------------------------------------

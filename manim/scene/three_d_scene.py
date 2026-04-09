@@ -466,7 +466,6 @@ class ThreeDScene(Scene):
                 self.remove(mob)
         elif config.renderer == RendererType.WEBGPU:
             self.renderer.camera.remove_fixed_orientation_mobjects(*mobjects)
-            self.remove(*mobjects)
 
     def remove_fixed_in_frame_mobjects(self, *mobjects: Mobject):
         """
@@ -488,7 +487,6 @@ class ThreeDScene(Scene):
                 self.remove(mob)
         elif config.renderer == RendererType.WEBGPU:
             self.renderer.camera.remove_fixed_in_frame_mobjects(*mobjects)
-            self.remove(*mobjects)
 
     ##
     def set_to_default_angled_camera_orientation(self, **kwargs):

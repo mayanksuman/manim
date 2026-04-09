@@ -22,6 +22,7 @@ to WebGPU NDC (x, y ∈ [-1, 1], z ∈ [0, 1]).
 from __future__ import annotations
 
 import time
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -31,11 +32,13 @@ from PIL import Image
 from manim import config, logger
 from manim.constants import IN, OUT, PI, RIGHT, DOWN, LEFT
 from manim.mobject.mobject import Mobject
+from manim.mobject.types.image_mobject import AbstractImageMobject
 from manim.mobject.types.vectorized_mobject import VMobject
 from manim.scene.scene_file_writer import SceneFileWriter
 from manim.utils.color import color_to_rgba
 from manim.utils.exceptions import EndSceneEarlyException
 from manim.utils.hashing import get_hash_from_play_call
+from manim.utils.iterables import list_update
 from manim.utils.simple_functions import clip
 from manim.utils.space_ops import (
     quaternion_from_angle_axis,
@@ -93,7 +96,7 @@ class WebGPUCamera(Mobject):
     frame_shape
         (width, height) of the rendered frame.  Defaults to
         ``(config.frame_width, config.frame_height)``.
-    center_point
+    frame_center
         World-space origin of the camera frame.  Defaults to the origin.
     euler_angles
         (theta, phi, gamma) camera orientation angles in radians.
@@ -115,9 +118,9 @@ class WebGPUCamera(Mobject):
     def __init__(
         self,
         frame_shape: tuple[float, float] | None = None,
-        center_point: np.ndarray | None = None,
+        frame_center: np.ndarray | None = None,
         euler_angles: np.ndarray | None = None,
-        focal_distance: float = 2.0,
+        focal_distance: float = 20.0,
         orthographic: bool = False,
         minimum_polar_angle: float = -PI / 2,
         maximum_polar_angle: float = PI / 2,
@@ -135,24 +138,26 @@ class WebGPUCamera(Mobject):
             if frame_shape is not None
             else (float(config["frame_width"]), float(config["frame_height"]))
         )
-        self.center_point: np.ndarray = (
-            np.asarray(center_point, dtype=float)
-            if center_point is not None
-            else np.array([0.0, 0.0, 11.0], dtype=float)
+        self.frame_center: np.ndarray = (
+            np.asarray(frame_center, dtype=float)
+            if frame_center is not None
+            else np.array([0.0, 0.0, focal_distance], dtype=float)
         )
+        # Default theta matches Cairo's default (-90°) so that the initial
+        # rotation formula (theta + 90°) gives identity for 2-D scenes.
         self.euler_angles: np.ndarray = np.asarray(
-            euler_angles if euler_angles is not None else [0.0, 0.0, 0.0],
+            euler_angles if euler_angles is not None else [-PI / 2, 0.0, 0.0],
             dtype=float,
         )
-        self.refresh_rotation_matrix()
+        self.reset_rotation_matrix()
 
         # Fixed-mobject registries — populated by ThreeDScene helpers.
         # fixed_in_frame: objects rendered with identity rotation + ortho
         #   projection as a 2-D overlay on top of the 3-D scene (e.g. title text).
         # fixed_orientation: objects rendered with identity rotation + current
         #   projection so they don't tilt as the camera orbits (e.g. 3-D labels).
-        self._fixed_in_frame_mobjects: set[Mobject] = set()
-        self._fixed_orientation_mobjects: set[Mobject] = set()
+        self.fixed_in_frame_mobjects: set[Mobject] = set()
+        self.fixed_orientation_mobjects: set[Mobject] = set()
 
         # ThreeDScene.get_moving_mobjects() checks _frame_center and
         # get_value_trackers() to detect camera-driven animation.
@@ -161,8 +166,15 @@ class WebGPUCamera(Mobject):
         self._frame_center: Mobject = Mobject()
 
     def get_value_trackers(self) -> list:
-        """Required by ThreeDScene.get_moving_mobjects."""
-        return []
+        """Required by ThreeDScene.get_moving_mobjects.
+
+        Returning ``[self]`` ensures that when the camera has updaters (e.g.
+        ambient rotation), ThreeDScene.get_moving_mobjects() detects the camera
+        in ``moving_mobjects`` and returns all scene mobjects — preventing the
+        static-frame optimisation from freezing the 3-D scene under camera
+        motion.
+        """
+        return [self]
 
     # ------------------------------------------------------------------
     # Frame geometry helpers (mirrors OpenGLCamera)
@@ -182,7 +194,7 @@ class WebGPUCamera(Mobject):
 
     def get_center(self) -> np.ndarray:
         """World-space centre of the camera frame."""
-        return self.center_point.copy()
+        return self.frame_center.copy()
 
     def get_focal_distance(self) -> float:
         """Perspective focal distance in scene units."""
@@ -198,24 +210,39 @@ class WebGPUCamera(Mobject):
             float(config["frame_width"]),
             float(config["frame_height"]),
         )
-        self.center_point = np.zeros(3)
-        self.euler_angles = np.zeros(3)
-        self.refresh_rotation_matrix()
+        self.frame_center = np.array([0.0, 0.0, self.focal_distance], dtype=float)
+        self.euler_angles = np.array([-PI / 2, 0.0, 0.0])
+        self.reset_rotation_matrix()
         return self
 
     # ------------------------------------------------------------------
     # Rotation — matches OpenGLCamera.set/increment_* interface
     # ------------------------------------------------------------------
 
-    def refresh_rotation_matrix(self) -> None:
+    def reset_rotation_matrix(self) -> None:
         """Refresh the camera's inverse rotation matrix based on its Euler angles.
-        Matches Cairo's orientation.
+
+        The formula replicates Cairo's ThreeDCamera so that the same (theta, phi,
+        gamma) values produce the same view in both renderers.
+
+        Cairo's generate_rotation_matrix builds:
+          R = R_z(gamma) @ R_x(-phi) @ R_z(-theta - 90°)   (np.dot loop order)
+        and applies it to world column vectors in project_points.
+
+        The WebGPU view matrix stores ``inverse_rotation_matrix`` and applies it
+        directly.  ``rotation_matrix_transpose_from_quaternion(q)`` returns R_q^T
+        where R_q is the rotation for quaternion q.  To get R_q^T == R_cairo we
+        need:
+          R_q = R_cairo^T = R_z(theta + 90°) @ R_x(phi) @ R_z(-gamma)
+        i.e. the quaternion that rotates: first by -gamma around Z, then by phi
+        around X, then by (theta + 90°) around Z:
+          q = q(theta + PI/2, OUT) * q(phi, RIGHT) * q(-gamma, OUT)
         """
         theta, phi, gamma = self.euler_angles
         quat = quaternion_mult(
-            quaternion_from_angle_axis(theta, IN, axis_normalized=True),
+            quaternion_from_angle_axis(theta + PI / 2, OUT, axis_normalized=True),
             quaternion_from_angle_axis(phi, RIGHT, axis_normalized=True),
-            quaternion_from_angle_axis(gamma, OUT, axis_normalized=True),
+            quaternion_from_angle_axis(-gamma, OUT, axis_normalized=True),
         )
         self.inverse_rotation_matrix: np.ndarray = np.array(
             rotation_matrix_transpose_from_quaternion(np.asarray(quat, dtype=float)),
@@ -234,7 +261,7 @@ class WebGPUCamera(Mobject):
             self.euler_angles[1] = phi
         if gamma is not None:
             self.euler_angles[2] = gamma
-        self.refresh_rotation_matrix()
+        self.reset_rotation_matrix()
         return self
 
     def set_theta(self, theta: float) -> WebGPUCamera:
@@ -246,20 +273,25 @@ class WebGPUCamera(Mobject):
     def set_gamma(self, gamma: float) -> WebGPUCamera:
         return self.set_euler_angles(gamma=gamma)
 
-    _PERSPECTIVE_FAR: float = 50.0  # must match projection_matrix
+    _PERSPECTIVE_FAR: float = 200.0
 
     def set_focal_distance(self, focal_distance: float) -> WebGPUCamera:
-        """Set the perspective focal distance (= near plane distance).
+        """Set the perspective focal distance.
 
-        Larger values zoom in (more telephoto); smaller values zoom out.
-        Only has an effect when ``orthographic=False``.
-        Matches ``OpenGLCamera.focal_distance`` convention.
+        Matches Cairo's ``ThreeDCamera.focal_distance`` convention: larger
+        values push the camera further from the scene (same FOV, objects
+        appear further away); smaller values pull it closer.
 
-        ``focal_distance`` must be positive and strictly less than the far
-        plane (50.0).  Values outside that range are clamped.
+        The near plane is derived as ``focal_distance / 6`` so that the
+        frustum height at depth ``focal_distance`` exactly equals the frame
+        height — matching Cairo's perspective formula
+        ``factor = focal_distance / (focal_distance - z_cam)``.
+
+        ``focal_distance`` must be positive and less than ``_PERSPECTIVE_FAR``.
+        Values outside that range are clamped.
         """
-        max_near = self._PERSPECTIVE_FAR * (1.0 - 1e-4)
-        clamped = float(np.clip(focal_distance, 1e-4, max_near))
+        max_fd = self._PERSPECTIVE_FAR * (1.0 - 1e-4)
+        clamped = float(np.clip(focal_distance, 1e-4, max_fd))
         if clamped != focal_distance:
             logger.warning(
                 "WebGPUCamera.set_focal_distance: value %.4g clamped to %.4g "
@@ -267,11 +299,14 @@ class WebGPUCamera(Mobject):
                 focal_distance, clamped, self._PERSPECTIVE_FAR,
             )
         self.focal_distance = clamped
+        # Keep the virtual camera position (frame_center z) in sync so that
+        # the perspective projection exactly matches Cairo's formula at all depths.
+        self.frame_center[2] = clamped
         return self
 
     def increment_theta(self, dtheta: float) -> WebGPUCamera:
         self.euler_angles[0] += dtheta
-        self.refresh_rotation_matrix()
+        self.reset_rotation_matrix()
         return self
 
     def increment_phi(self, dphi: float) -> WebGPUCamera:
@@ -280,12 +315,12 @@ class WebGPUCamera(Mobject):
             self.minimum_polar_angle,
             self.maximum_polar_angle,
         )
-        self.refresh_rotation_matrix()
+        self.reset_rotation_matrix()
         return self
 
     def increment_gamma(self, dgamma: float) -> WebGPUCamera:
         self.euler_angles[2] += dgamma
-        self.refresh_rotation_matrix()
+        self.reset_rotation_matrix()
         return self
 
     # ------------------------------------------------------------------
@@ -301,7 +336,7 @@ class WebGPUCamera(Mobject):
         OpenGLCamera behavior where the camera orbits the focal point).
         """
         R = np.asarray(self.inverse_rotation_matrix, dtype=np.float32)  # 3×3
-        c = self.center_point.astype(np.float32)
+        c = self.frame_center.astype(np.float32)
         view = np.eye(4, dtype=np.float32)
         view[:3, :3] = R
         # Translation in camera space: T(-c) followed by rotation R is equivalent
@@ -320,7 +355,7 @@ class WebGPUCamera(Mobject):
         depth ordering within the fixed layer is consistent with the main scene.
         """
         view = np.eye(4, dtype=np.float32)
-        view[2, 3] = -float(self.center_point[2])
+        view[2, 3] = -float(self.frame_center[2])
         return view
 
     @property
@@ -355,21 +390,26 @@ class WebGPUCamera(Mobject):
         """4×4 float32 projection matrix in WebGPU NDC convention (z ∈ [0, 1]).
 
         Perspective when ``self.orthographic`` is False (default).
-        Perspective otherwise — focal distance drives the field of view.
+
+        Design: the near plane is derived as ``focal_distance / 6`` so that the
+        visible height at camera depth ``focal_distance`` (where world_z = 0
+        maps to) exactly equals the frame height.  Combined with
+        ``frame_center_z = focal_distance``, this exactly replicates Cairo's
+        perspective formula ``factor = focal_distance / (focal_distance - z_cam)``
+        (for all depths, not just at world_z = 0).
         """
         fw, fh = self.frame_shape
-        near, far = self.near, self.far
 
         if self.orthographic:
             return self.ortho_projection_matrix
         else:
-            # Perspective mapping for WebGPU: W_clip = -z_view, z_clip ∈ [0, 1].
-            # near = focal_distance (matches OpenGLCamera's implicit convention where
-            # the default focal_distance=2.0 equals OpenGL's hardcoded near=2).
-            # Changing focal_distance zooms the scene: larger → more telephoto.
-            # FOV is set by w=fw/6, h=fh/6 (same as opengl.perspective_projection_matrix).
+            # n = fd/6, w = fw/6, h = fh/6  →  2n/w = 2*fd/fw, 2n/h = 2*fd/fh
+            # → NDC_y = (2*fd/fh) * y / (-z_view)
+            #         = (2*fd/fh) * y / (fd - z_cairo)  [with z_view = z_cairo - fd]
+            # Cairo: NDC_y = fd/(fd-z_cairo) * y / (fh/2) = 2*fd/fh * y / (fd-z_cairo)  ✓
             f = self._PERSPECTIVE_FAR
-            n = float(np.clip(self.focal_distance, 1e-4, f * (1.0 - 1e-4)))
+            fd = self.focal_distance
+            n = float(np.clip(fd / 6.0, 1e-6, f * (1.0 - 1e-4)))
             w, h = fw / 6.0, fh / 6.0
             return np.array(
                 [
@@ -393,11 +433,11 @@ class WebGPUCamera(Mobject):
         identity camera rotation, and an orthographic projection so they always
         appear on top at their 2-D screen-space coordinates.
         """
-        self._fixed_in_frame_mobjects.update(mobjects)
+        self.fixed_in_frame_mobjects.update(mobjects)
 
     def remove_fixed_in_frame_mobjects(self, *mobjects: Mobject) -> None:
         """Unregister mobjects previously added with add_fixed_in_frame_mobjects."""
-        self._fixed_in_frame_mobjects.difference_update(mobjects)
+        self.fixed_in_frame_mobjects.difference_update(mobjects)
 
     def add_fixed_orientation_mobjects(self, *mobjects: Mobject) -> None:
         """Register mobjects whose orientation is frozen relative to the camera.
@@ -406,11 +446,11 @@ class WebGPUCamera(Mobject):
         normally) but the camera rotation is not applied — they remain upright as
         the camera orbits.  Useful for 3-D labels that should always face forward.
         """
-        self._fixed_orientation_mobjects.update(mobjects)
+        self.fixed_orientation_mobjects.update(mobjects)
 
     def remove_fixed_orientation_mobjects(self, *mobjects: Mobject) -> None:
         """Unregister mobjects previously added with add_fixed_orientation_mobjects."""
-        self._fixed_orientation_mobjects.difference_update(mobjects)
+        self.fixed_orientation_mobjects.difference_update(mobjects)
 
 
 # ---------------------------------------------------------------------------
@@ -465,11 +505,11 @@ class WebGPURenderer:
 
         # Scene-wide lighting — read by _build_camera_uniform_buf() each frame.
         # light_color / ambient_color are RGB floats in [0, 1].
-        self.light_source_position: np.ndarray = np.array([-10.0, 10.0, 5.0])
+        self.light_source_position: np.ndarray = np.array([10.0, 10.0, -10.0])
         self.light_color: np.ndarray           = np.array([1.0, 1.0, 1.0])
-        self.light_intensity: float            = 100.0
+        self.light_intensity: float            = 300.0
         self.ambient_color: np.ndarray         = np.array([1.0, 1.0, 1.0])
-        self.ambient_intensity: float          = 0.4
+        self.ambient_intensity: float          = 0.5
 
         # Filled by init_scene():
         self._device: wgpu_t.GPUDevice | None = None
@@ -503,6 +543,14 @@ class WebGPURenderer:
         self._oit_compose_bgl: wgpu_t.GPUBindGroupLayout | None = None
         self._oit_compose_bind_group: wgpu_t.GPUBindGroup | None = None
 
+        # Image pipeline (image.wgsl) — renders ImageMobject pixel arrays as
+        # textured quads before the VMobject pass (painter's algorithm).
+        self._image_pipeline: wgpu_t.GPURenderPipeline | None = None
+        self._image_tex_bgl: wgpu_t.GPUBindGroupLayout | None = None
+        # Cache: ImageMobject → (fingerprint, GPUTexture, GPUBindGroup).
+        # Keyed weakly so destroyed mobs release their GPU textures.
+        self._image_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
         # Compact readback compute pipeline (GPU row-depadding + B↔R fix).
         self._readback_compute_pipeline: wgpu_t.GPUComputePipeline | None = None
         self._readback_compute_bgl: wgpu_t.GPUBindGroupLayout | None = None
@@ -524,6 +572,11 @@ class WebGPURenderer:
         self.fixed_frame_bind_group: wgpu_t.GPUBindGroup | None = None
         self._fixed_frame_uniform_buf: wgpu_t.GPUBuffer | None = None
         self.frame_vbos: list[wgpu_t.GPUBuffer] = []
+
+        # _FrameData cache: keyed by cache slot name ("normal", "orient", "frame").
+        # Each entry is (fingerprint_bytes, _FrameData).  On a fingerprint hit we
+        # return the cached _FrameData, skipping all tessellation and buffer uploads.
+        self._fd_cache: dict[str, tuple[bytes, Any]] = {}
 
     # ------------------------------------------------------------------
     # static_image property — scene.py sets this to None at end of play()
@@ -623,6 +676,37 @@ class WebGPURenderer:
 
         self._create_oit_resources(width, height)
         self._create_readback_pipeline(width, height)
+        self._image_tex_bgl, self._image_pipeline = self._create_image_pipeline()
+
+        # Persistent camera uniform buffers — created once, updated each frame via
+        # write_buffer.  Using COPY_DST so queue.write_buffer can write into them.
+        # These stable GPU objects let cached _FrameData bind groups remain valid
+        # across frames: the bind group references the same buffer; write_buffer
+        # updates its contents so the shader always sees the current camera.
+        self._camera_uniform_buf = self._device.create_buffer(
+            size=176,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        self._fixed_orient_uniform_buf = self._device.create_buffer(
+            size=176,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        self._fixed_frame_uniform_buf = self._device.create_buffer(
+            size=176,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+
+        # Persistent camera bind groups — constant layout + constant buffer objects,
+        # so they never need to be recreated.
+        def _make_persistent_bg(buf: wgpu_t.GPUBuffer) -> wgpu_t.GPUBindGroup:
+            return self._device.create_bind_group(
+                layout=self._proj_bgl,
+                entries=[{"binding": 0, "resource": {"buffer": buf, "offset": 0, "size": 176}}],
+            )
+
+        self.camera_bind_group      = _make_persistent_bg(self._camera_uniform_buf)
+        self.fixed_camera_bind_group = _make_persistent_bg(self._fixed_orient_uniform_buf)
+        self.fixed_frame_bind_group  = _make_persistent_bg(self._fixed_frame_uniform_buf)
 
         if self.should_create_window():
             from .webgpu_renderer_window import WebGPUWindow
@@ -840,6 +924,249 @@ class WebGPURenderer:
             },
         )
 
+    def _create_image_pipeline(
+        self,
+    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
+        """Create the render pipeline for ImageMobject textured quads.
+
+        Layout
+        ------
+        group 0 — camera uniform (reuses ``_proj_bgl``, same as VMobject shaders)
+        group 1 — texture_2d<f32> at binding 0, sampler at binding 1
+
+        Vertex buffer (stride 20 B):
+          location 0 — in_pos  float32x3  (12 B)
+          location 1 — in_uv   float32x2  ( 8 B)
+        """
+        assert self._device is not None
+        assert self._proj_bgl is not None
+
+        shader_path = Path(__file__).parent / "shaders" / "image.wgsl"
+        shader = self._device.create_shader_module(
+            code=shader_path.read_text(encoding="utf-8")
+        )
+
+        # Group 1: texture + sampler
+        tex_bgl = self._device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {
+                        "sample_type": "float",
+                        "view_dimension": "2d",
+                        "multisampled": False,
+                    },
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+            ]
+        )
+
+        layout = self._device.create_pipeline_layout(
+            bind_group_layouts=[self._proj_bgl, tex_bgl]
+        )
+
+        blend = {
+            "color": {
+                "src_factor": "src-alpha",
+                "dst_factor": "one-minus-src-alpha",
+                "operation": "add",
+            },
+            "alpha": {
+                "src_factor": "one",
+                "dst_factor": "one-minus-src-alpha",
+                "operation": "add",
+            },
+        }
+
+        pipeline = self._device.create_render_pipeline(
+            layout=layout,
+            vertex={
+                "module": shader,
+                "entry_point": "vs_main",
+                "buffers": [
+                    {
+                        "array_stride": 20,  # 3+2 floats × 4 B
+                        "step_mode": "vertex",
+                        "attributes": [
+                            {"format": "float32x3", "offset":  0, "shader_location": 0},
+                            {"format": "float32x2", "offset": 12, "shader_location": 1},
+                        ],
+                    }
+                ],
+            },
+            fragment={
+                "module": shader,
+                "entry_point": "fs_main",
+                "targets": [
+                    {
+                        "format": wgpu.TextureFormat.bgra8unorm,
+                        "blend": blend,
+                    }
+                ],
+            },
+            primitive={"topology": "triangle-list", "cull_mode": "none"},
+            depth_stencil={
+                # Must match the render pass's depth format.
+                # Images use painter's algorithm (draw order), not depth test.
+                "format": wgpu.TextureFormat.depth24plus,
+                "depth_write_enabled": False,
+                "depth_compare": "always",
+                "stencil_front": {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_back":  {"compare": "always", "fail_op": "keep", "depth_fail_op": "keep", "pass_op": "keep"},
+                "stencil_read_mask": 0,
+                "stencil_write_mask": 0,
+            },
+            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
+        )
+
+        return tex_bgl, pipeline
+
+    def _image_fingerprint(self, pixel_array: np.ndarray) -> int:
+        """Cheap dirty-check fingerprint for a pixel array.
+
+        Samples the first 64, middle 64, and last 64 bytes of the flattened
+        array plus the shape tuple — fast enough for typical image sizes and
+        reliably detects in-place changes such as set_opacity().
+        """
+        flat = pixel_array.ravel()
+        n = len(flat)
+        if n <= 192:
+            return hash((pixel_array.shape, flat.tobytes()))
+        mid = n // 2
+        sample = np.concatenate([flat[:64], flat[mid : mid + 64], flat[-64:]])
+        return hash((pixel_array.shape, sample.tobytes()))
+
+    def _get_image_gpu_resources(
+        self, mob: Any
+    ) -> tuple[wgpu_t.GPUTexture, wgpu_t.GPUBindGroup] | None:
+        """Return (texture, bind_group) for *mob*, re-uploading if pixel_array changed.
+
+        Returns None if the mob has no valid pixel array.
+        """
+        assert self._device is not None
+        assert self._image_tex_bgl is not None
+
+        pixel_array: np.ndarray | None = getattr(mob, "pixel_array", None)
+        if pixel_array is None or pixel_array.ndim != 3 or pixel_array.shape[2] < 4:
+            return None
+
+        fp = self._image_fingerprint(pixel_array)
+        cached = self._image_cache.get(mob)
+        if cached is not None and cached[0] == fp:
+            return cached[1], cached[2]
+
+        # (Re-)upload texture.
+        h, w = pixel_array.shape[:2]
+        # Ensure RGBA uint8.
+        if pixel_array.dtype != np.uint8:
+            pixel_array = pixel_array.astype(np.uint8)
+
+        # bytes_per_row must be a multiple of 256.
+        bytes_per_row = w * 4
+        aligned_bpr = (bytes_per_row + 255) & ~255
+        if aligned_bpr == bytes_per_row:
+            data = pixel_array.tobytes()
+        else:
+            rows = [
+                pixel_array[r].ravel().tobytes() + b"\x00" * (aligned_bpr - bytes_per_row)
+                for r in range(h)
+            ]
+            data = b"".join(rows)
+
+        tex = self._device.create_texture(
+            size=(w, h, 1),
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+        )
+        self._device.queue.write_texture(
+            {"texture": tex, "mip_level": 0, "origin": (0, 0, 0)},
+            data,
+            {"bytes_per_row": aligned_bpr, "rows_per_image": h},
+            (w, h, 1),
+        )
+
+        sampler = self._device.create_sampler(
+            min_filter="linear",
+            mag_filter="linear",
+            address_mode_u="clamp-to-edge",
+            address_mode_v="clamp-to-edge",
+        )
+
+        bg = self._device.create_bind_group(
+            layout=self._image_tex_bgl,
+            entries=[
+                {"binding": 0, "resource": tex.create_view()},
+                {"binding": 1, "resource": sampler},
+            ],
+        )
+
+        self._image_cache[mob] = (fp, tex, bg)
+        return tex, bg
+
+    def _build_image_vbo(self, mob: Any) -> wgpu_t.GPUBuffer | None:
+        """Build a 6-vertex (20 B/vertex) VBO for *mob*'s bounding quad.
+
+        Corner layout from AbstractImageMobject.reset_points():
+          points[0] = UP + LEFT   → UV (0, 0)
+          points[1] = UP + RIGHT  → UV (1, 0)
+          points[2] = DOWN + LEFT → UV (0, 1)
+          points[3] = DOWN + RIGHT→ UV (1, 1)
+
+        Two CCW triangles: [0,1,2] and [1,3,2].
+        """
+        assert self._device is not None
+
+        pts = getattr(mob, "points", None)
+        if pts is None or len(pts) < 4:
+            return None
+
+        corners = pts[:4].astype(np.float32)  # (4, 3)
+        uvs = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32
+        )
+        # Index order: 0,1,2, 1,3,2
+        idx = [0, 1, 2, 1, 3, 2]
+        data = np.empty((6, 5), dtype=np.float32)
+        data[:, :3] = corners[idx]
+        data[:, 3:] = uvs[idx]
+
+        buf = self._device.create_buffer_with_data(
+            data=data.tobytes(),
+            usage=wgpu.BufferUsage.VERTEX,
+        )
+        self.frame_vbos.append(buf)
+        return buf
+
+    def _draw_images_in_pass(
+        self,
+        render_pass: Any,
+        image_mobs: list,
+        camera_bind_group: Any,
+    ) -> None:
+        """Draw all *image_mobs* into *render_pass* using the image pipeline."""
+        if not image_mobs or self._image_pipeline is None:
+            return
+
+        render_pass.set_pipeline(self._image_pipeline)
+        render_pass.set_bind_group(0, camera_bind_group, [], 0, 0)
+
+        for mob in image_mobs:
+            resources = self._get_image_gpu_resources(mob)
+            if resources is None:
+                continue
+            _, tex_bg = resources
+            vbo = self._build_image_vbo(mob)
+            if vbo is None:
+                continue
+            render_pass.set_bind_group(1, tex_bg, [], 0, 0)
+            render_pass.set_vertex_buffer(0, vbo)
+            render_pass.draw(6)
+
     def _create_oit_resources(self, width: int, height: int) -> None:
         """Create OIT accumulation textures, pipelines, and bind groups."""
         assert self._device is not None
@@ -960,12 +1287,12 @@ class WebGPURenderer:
     # Camera bind group (rebuilt each frame when projection changes)
     # ------------------------------------------------------------------
 
-    def _pack_camera_uniforms(
+    def _pack_camera_uniforms_bytes(
         self,
         proj: np.ndarray,
         view: np.ndarray,
-    ) -> wgpu_t.GPUBuffer:
-        """Pack a 176-byte camera+lighting uniform buffer from explicit proj/view matrices.
+    ) -> bytes:
+        """Return a 176-byte camera+lighting uniform payload from explicit proj/view.
 
         Layout (matches Uniforms struct in surface_combined.wgsl / surface_oit.wgsl):
           offset   0 — projection        mat4x4<f32>  64 B
@@ -976,12 +1303,7 @@ class WebGPURenderer:
           offset 156 — ambient_intensity f32           4 B
           offset 160 — ambient_color     vec3<f32>    12 B
           offset 172 — _pad              f32           4 B
-
-        Called by _build_camera_bind_group for each of the three per-frame
-        variants: normal, fixed-orientation, and fixed-in-frame.
         """
-        assert self._device is not None
-
         proj_bytes = proj.T.flatten().astype(np.float32).tobytes()
         view_bytes = view.T.flatten().astype(np.float32).tobytes()
 
@@ -999,23 +1321,26 @@ class WebGPURenderer:
         block_c = np.zeros(4, dtype=np.float32)
         block_c[:3] = np.asarray(self.ambient_color, dtype=np.float32)
 
+        return (proj_bytes + view_bytes
+                + block_a.tobytes() + block_b.tobytes() + block_c.tobytes())
+
+    # Keep the old name as a shim so any external callers don't break.
+    def _pack_camera_uniforms(self, proj: np.ndarray, view: np.ndarray) -> wgpu_t.GPUBuffer:
+        """Create a throw-away 176-byte uniform buffer (legacy path, rarely used)."""
+        assert self._device is not None
         buf = self._device.create_buffer_with_data(
-            data=(proj_bytes + view_bytes
-                  + block_a.tobytes() + block_b.tobytes() + block_c.tobytes()),
+            data=self._pack_camera_uniforms_bytes(proj, view),
             usage=wgpu.BufferUsage.UNIFORM,
         )
         self.frame_vbos.append(buf)
         return buf
 
-    def _build_camera_uniform_buf(self) -> wgpu_t.GPUBuffer:
-        """Pack the 176-byte camera+lighting uniform with the current view/projection."""
-        return self._pack_camera_uniforms(
-            self.camera.projection_matrix,
-            self.camera.view_matrix,
-        )
-
     def _build_camera_bind_group(self) -> wgpu_t.GPUBindGroup:
-        """Build all three per-frame camera bind groups.
+        """Update all three persistent camera uniform buffers for the current frame.
+
+        The three uniform buffers and their bind groups are created once in
+        init_scene.  Each frame we write fresh matrix data into the buffers via
+        queue.write_buffer so the shaders see the updated camera.
 
         normal (camera_bind_group)
             Full camera rotation + current projection.  Used for all regular
@@ -1032,33 +1357,27 @@ class WebGPURenderer:
             with a fresh depth buffer so they always appear on top.
         """
         assert self._device is not None
-        assert self._proj_bgl is not None
-
-        def _make_bg(buf: wgpu_t.GPUBuffer) -> wgpu_t.GPUBindGroup:
-            return self._device.create_bind_group(
-                layout=self._proj_bgl,
-                entries=[{"binding": 0, "resource": {"buffer": buf, "offset": 0, "size": 176}}],
-            )
-
-        # Normal bind group
-        self._camera_uniform_buf = self._build_camera_uniform_buf()
-        normal_bg = _make_bg(self._camera_uniform_buf)
+        assert self._camera_uniform_buf is not None
+        assert self._fixed_orient_uniform_buf is not None
+        assert self._fixed_frame_uniform_buf is not None
 
         fixed_view = self.camera.fixed_view_matrix
 
-        # Fixed-orientation: rotation-stripped view, same projection as scene
-        self._fixed_orient_uniform_buf = self._pack_camera_uniforms(
-            self.camera.projection_matrix, fixed_view
+        self._device.queue.write_buffer(
+            self._camera_uniform_buf, 0,
+            self._pack_camera_uniforms_bytes(self.camera.projection_matrix, self.camera.view_matrix),
         )
-        self.fixed_camera_bind_group = _make_bg(self._fixed_orient_uniform_buf)
-
-        # Fixed-in-frame: rotation-stripped view, always orthographic
-        self._fixed_frame_uniform_buf = self._pack_camera_uniforms(
-            self.camera.ortho_projection_matrix, fixed_view
+        self._device.queue.write_buffer(
+            self._fixed_orient_uniform_buf, 0,
+            self._pack_camera_uniforms_bytes(self.camera.projection_matrix, fixed_view),
         )
-        self.fixed_frame_bind_group = _make_bg(self._fixed_frame_uniform_buf)
+        self._device.queue.write_buffer(
+            self._fixed_frame_uniform_buf, 0,
+            self._pack_camera_uniforms_bytes(self.camera.ortho_projection_matrix, fixed_view),
+        )
 
-        return normal_bg
+        # Return the persistent normal bind group (unchanged object).
+        return self.camera_bind_group
 
     # ------------------------------------------------------------------
     # Pipeline / device accessors (used by webgpu_vmobject_rendering)
@@ -1147,63 +1466,158 @@ class WebGPURenderer:
         self.camera_bind_group = self._build_camera_bind_group()
         self.frame_vbos = []
 
-        # ── Partition mobjects ────────────────────────────────────────────
+        # ── Partition and z-sort mobjects ────────────────────────────────
         cam            = self.camera
-        fixed_in_frame = cam._fixed_in_frame_mobjects
-        fixed_orient   = cam._fixed_orientation_mobjects
+        fixed_in_frame = cam.fixed_in_frame_mobjects
+        fixed_orient   = cam.fixed_orientation_mobjects
+        fixed_view     = self.camera.fixed_view_matrix
 
-        # Expand non-VMobject containers (e.g. Group) to their VMobject children.
-        # This handles the case where scene.add(Group(vmobject)) causes
-        # restructure_mobjects to replace the vmobject in scene.mobjects with the
-        # Group wrapper, which is not a VMobject and would otherwise be skipped.
-        def _flatten_to_vmobjects(source: list) -> list:
-            result: list = []
-            seen: set[int] = set()
-
-            def _add(mob: Any) -> None:
-                if id(mob) in seen:
-                    return
-                seen.add(id(mob))
-                if isinstance(mob, VMobject):
-                    result.append(mob)
-                else:
-                    for sub in mob.submobjects:
-                        _add(sub)
-
-            for mob in source:
-                _add(mob)
-            return result
-
-        source = mob_list if mob_list is not None else list(scene.mobjects)
-        scene_mobs = _flatten_to_vmobjects(source)
-
-        normal_mobs       = [m for m in scene_mobs if m not in fixed_in_frame and m not in fixed_orient]
-        fixed_orient_mobs = [m for m in scene_mobs if m in fixed_orient]
-        fixed_frame_mobs  = [m for m in scene_mobs if m in fixed_in_frame]
-
-        # ── CPU tessellation + GPU buffer upload (no commands yet) ────────
         assert self._camera_uniform_buf is not None
         assert self._fixed_orient_uniform_buf is not None
         assert self._fixed_frame_uniform_buf is not None
 
-        normal_fd = collect_frame_data(self, normal_mobs, self._camera_uniform_buf)
+        if mob_list is not None:
+            # Caller (save_static_frame_data, render) already sorted the list.
+            source = mob_list
+        else:
+            # Full-frame path: merge mobjects + foreground_mobjects and apply
+            # z_index ordering (Bug 1).  foreground_mobjects are already present
+            # in scene.mobjects (add_foreground_mobjects calls add()), so
+            # list_update just removes the duplicates from the left side.
+            # We then sort with a two-key tuple so that:
+            #   key[0] = 0 for normal mobs, 1 for foreground mobs
+            #   key[1] = z_index
+            # This ensures foreground mobs always draw last (on top) even when
+            # they share z_index=0 with regular mobs (Bug 3).
+            all_mobs = list_update(list(scene.mobjects), list(scene.foreground_mobjects))
+            if self.camera.use_z_index:
+                foreground_ids = {id(m) for m in scene.foreground_mobjects}
+                source = sorted(
+                    all_mobs,
+                    key=lambda m: (1 if id(m) in foreground_ids else 0, m.z_index),
+                )
+            else:
+                source = all_mobs
 
-        # Fixed-orientation: identity rotation, same projection as scene.
-        # Pass the stripped view matrix so CPU bounding quads are computed in the
-        # same space as the GPU will rasterise them.
-        fixed_view = self.camera.fixed_view_matrix
-        fixed_orient_fd = collect_frame_data(
-            self, fixed_orient_mobs, self._fixed_orient_uniform_buf,
-            view_matrix_override=fixed_view,
-        )
+        # Build a z-ordered render queue by walking `source` in order.
+        #
+        # Rules:
+        #   • fixed_in_frame mobs → skipped here, collected separately below
+        #   • fixed_orient mobs   → VMobject batch with stripped-rotation camera
+        #   • normal VMobjects    → VMobject batch with full camera
+        #   • ImageMobjects       → image draw item, flushing any pending
+        #                           VMobject runs first so z-order is respected
+        #   • containers (Group…) → recursed
+        #
+        # The resulting queue is a list of items:
+        #   ('vmobs', _FrameData, camera_bind_group)
+        #   ('image', ImageMobject)
+        #
+        # Within the main render pass these are drawn in queue order, giving
+        # correct painter's-algorithm depth for any interleaving of images and
+        # VMobjects in scene.mobjects.
 
-        # Fixed-in-frame: identity rotation + orthographic projection.
-        # Both overrides are needed so the CPU quad positions match the GPU output.
+        render_queue: list[tuple] = []
+        _run_normal: list = []
+        _run_orient: list = []
+        _seen: set[int] = set()
+
+        def _flush_runs() -> None:
+            if _run_normal:
+                fd = collect_frame_data(
+                    self, list(_run_normal), self._camera_uniform_buf,
+                    cache_slot="normal",
+                )
+                if fd is not None:
+                    render_queue.append(("vmobs", fd, self.camera_bind_group))
+                _run_normal.clear()
+            if _run_orient:
+                fd = collect_frame_data(
+                    self, list(_run_orient), self._fixed_orient_uniform_buf,
+                    view_matrix_override=fixed_view,
+                    center_view_matrix=self.camera.view_matrix,
+                    cache_slot="orient",
+                )
+                if fd is not None:
+                    render_queue.append(("vmobs", fd, self.fixed_camera_bind_group))
+                _run_orient.clear()
+
+        def _walk(mob: Any) -> None:
+            if id(mob) in _seen:
+                return
+            _seen.add(id(mob))
+            if isinstance(mob, AbstractImageMobject):
+                _flush_runs()
+                render_queue.append(("image", mob))
+            elif isinstance(mob, VMobject):
+                if mob in fixed_in_frame:
+                    pass  # handled in the overlay pass below
+                elif mob in fixed_orient:
+                    _run_orient.append(mob)
+                else:
+                    _run_normal.append(mob)
+            else:
+                for sub in mob.submobjects:
+                    _walk(sub)
+
+        for mob in source:
+            _walk(mob)
+        _flush_runs()
+
+        # Pre-fetch image GPU resources (texture upload, VBO) before the
+        # command encoder starts.  Replace ('image', mob) queue items with
+        # ('image', vbo, tex_bg) so the render loop has no CPU work left.
+        resolved_queue: list[tuple] = []
+        for item in render_queue:
+            if item[0] == "image":
+                mob = item[1]
+                vbo = self._build_image_vbo(mob)
+                resources = self._get_image_gpu_resources(mob)
+                if vbo is not None and resources is not None:
+                    resolved_queue.append(("image", vbo, resources[1]))
+            else:
+                resolved_queue.append(item)
+
+        # Fixed-in-frame: always last, separate overlay pass.
+        fixed_frame_mobs = [
+            m for m in _seen
+            if False  # placeholder — rebuilt below from source flatten
+        ]
+        # Re-flatten source to get all VMobjects (including those inside containers)
+        # and filter to the fixed_in_frame set.
+        def _flatten_vmobjects(src: list) -> list:
+            out: list = []
+            seen2: set[int] = set()
+
+            def _f(m: Any) -> None:
+                if id(m) in seen2:
+                    return
+                seen2.add(id(m))
+                if isinstance(m, VMobject):
+                    out.append(m)
+                else:
+                    for s in m.submobjects:
+                        _f(s)
+
+            for m in src:
+                _f(m)
+            return out
+
+        fixed_frame_mobs = [
+            m for m in _flatten_vmobjects(source) if m in fixed_in_frame
+        ]
         fixed_frame_fd = collect_frame_data(
             self, fixed_frame_mobs, self._fixed_frame_uniform_buf,
             view_matrix_override=fixed_view,
             proj_matrix_override=self.camera.ortho_projection_matrix,
+            cache_slot="frame",
         )
+
+        # OIT surfaces come from all normal VMobject batches in the queue.
+        all_normal_fds = [
+            item[1] for item in resolved_queue if item[0] == "vmobs"
+            and item[2] is self.camera_bind_group
+        ]
 
         encoder = self._device.create_command_encoder()
 
@@ -1224,18 +1638,19 @@ class WebGPURenderer:
         # ready by the time the fragment shader reads it in Pass 1.
         cp = encoder.begin_compute_pass()
         cp.set_pipeline(self._cubic_to_quads_pipeline)
-        for fd in (normal_fd, fixed_orient_fd, fixed_frame_fd):
-            if fd is not None and fd.n_cubics_total > 0 and fd.compute_bg is not None:
+        all_fds = [
+            item[1] for item in resolved_queue if item[0] == "vmobs"
+        ] + ([fixed_frame_fd] if fixed_frame_fd is not None else [])
+        for fd in all_fds:
+            if fd.n_cubics_total > 0 and fd.compute_bg is not None:
                 cp.set_bind_group(0, fd.compute_bg, [], 0, 0)
                 cp.dispatch_workgroups((fd.n_cubics_total + 63) // 64, 1, 1)
         cp.end()
 
         # ── Pass 1: main render ───────────────────────────────────────────
-        # When blit_static, the render texture already has the static background
-        # from the pre-pass blit, so we use load_op="load" to preserve it.
-        # The depth buffer is always cleared: moving mobs composite on top
-        # regardless of their world-space depth relative to static objects,
-        # which matches Cairo's static-image compositing behaviour.
+        # Draw the z-ordered render queue (VMobject batches and images
+        # interleaved in scene.mobjects order) so painter's-algorithm depth
+        # is respected for any combination of images and geometry.
         color_load_op = "load" if blit_static else "clear"
         main_pass = encoder.begin_render_pass(
             color_attachments=[
@@ -1255,18 +1670,30 @@ class WebGPURenderer:
         )
         self.current_render_pass = main_pass
 
-        if normal_fd is not None:
-            draw_frame_data(self, normal_fd, self.camera_bind_group)
-
-        if fixed_orient_fd is not None:
-            draw_frame_data(self, fixed_orient_fd, self.fixed_camera_bind_group)
+        for item in resolved_queue:
+            if item[0] == "image":
+                _, vbo, tex_bg = item
+                main_pass.set_pipeline(self._image_pipeline)
+                main_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
+                main_pass.set_bind_group(1, tex_bg, [], 0, 0)
+                main_pass.set_vertex_buffer(0, vbo)
+                main_pass.draw(6)
+            elif item[0] == "vmobs":
+                _, fd, cam_bg = item
+                draw_frame_data(self, fd, cam_bg)
 
         main_pass.end()
 
         # ── Pass 2: OIT accumulation ──────────────────────────────────────
-        # Uses the normal (rotated) camera bind group for the surface OIT pass.
-        oit_fd = normal_fd  # fixed-orient surfaces are uncommon; handle normally
-        if oit_fd is not None and oit_fd.oit_indices:
+        # Collect OIT surfaces from all normal-camera VMobject batches.
+        oit_fds = [fd for fd in all_normal_fds if fd.oit_indices]
+        if oit_fds:
+            # Use the first fd with OIT surfaces as representative; actual
+            # OIT draw loops over all of them below.
+            oit_fd = oit_fds[0]
+        else:
+            oit_fd = None
+        if oit_fds:
             oit_pass = encoder.begin_render_pass(
                 color_attachments=[
                     {
@@ -1290,16 +1717,17 @@ class WebGPURenderer:
             )
             oit_pass.set_pipeline(self.surface_oit_pipeline)
             oit_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
-            for idx in oit_fd.oit_indices:
-                arr = oit_fd.surface_parts[idx]
-                oit_pass.set_vertex_buffer(
-                    0, oit_fd.surface_buf,
-                    oit_fd.surface_byte_offsets[idx], arr.nbytes,
-                )
-                oit_pass.draw(len(arr), 1, 0, 0)
+            for oit_fd in oit_fds:
+                for idx in oit_fd.oit_indices:
+                    arr = oit_fd.surface_parts[idx]
+                    oit_pass.set_vertex_buffer(
+                        0, oit_fd.surface_buf,
+                        oit_fd.surface_byte_offsets[idx], arr.nbytes,
+                    )
+                    oit_pass.draw(len(arr), 1, 0, 0)
             oit_pass.end()
 
-            # ── Pass 3: OIT composition ───────────────────────────────────
+            # ── Pass 3: OIT composition ──────────────────────────────────
             compose_pass = encoder.begin_render_pass(
                 color_attachments=[
                     {"view": self._render_texture_view, "load_op": "load", "store_op": "store"}
@@ -1332,7 +1760,8 @@ class WebGPURenderer:
         self._device.queue.submit([encoder.finish()])
 
         self.current_render_pass = None
-        self.camera_bind_group = None
+        # camera_bind_group is now persistent (created once in init_scene) —
+        # do NOT null it here.
         self.frame_vbos = []
 
         self.animation_elapsed_time = time.time() - self.animation_start_time
@@ -1542,11 +1971,14 @@ class WebGPURenderer:
 
     def render(self, scene: Scene, frame_offset: float, moving_mobjects: list) -> None:
         if self._has_static_frame:
-            # Composite only the moving top-level mobjects on top of the
-            # pre-rendered static background.  We derive the "top-level moving"
-            # set by excluding the static mob IDs from scene.mobjects.
-            top_moving = [m for m in scene.mobjects if id(m) not in self._static_mob_ids]
-            self.update_frame(scene, mob_list=top_moving, blit_static=True)
+            # Use the family-level moving list produced by begin_animations()
+            # directly.  That list is already z_index-sorted by
+            # extract_mobject_family_members and is at the correct granularity
+            # (same as what Cairo passes to its camera).  Filtering
+            # scene.mobjects by static IDs was wrong because it operated at
+            # top-level container granularity while _static_mob_ids stores
+            # family-member IDs (Bug 2 fix).
+            self.update_frame(scene, mob_list=list(moving_mobjects), blit_static=True)
         else:
             self.update_frame(scene)
         if self.skip_animations:
@@ -1558,8 +1990,7 @@ class WebGPURenderer:
                 if self.window.is_closing:
                     break
                 if self._has_static_frame:
-                    top_moving = [m for m in scene.mobjects if id(m) not in self._static_mob_ids]
-                    self.update_frame(scene, mob_list=top_moving, blit_static=True)
+                    self.update_frame(scene, mob_list=list(moving_mobjects), blit_static=True)
                 else:
                     self.update_frame(scene)
                 self.window.present()

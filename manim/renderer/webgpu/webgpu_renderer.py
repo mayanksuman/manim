@@ -33,7 +33,7 @@ from manim import config, logger
 from manim.constants import IN, OUT, PI, RIGHT, DOWN, LEFT
 from manim.mobject.mobject import Mobject
 from manim.mobject.three_d.light_source import LightSource
-from manim.mobject.types.image_mobject import AbstractImageMobject
+from manim.mobject.types.image_mobject import AbstractImageMobject, ImageMobjectFromCamera
 from manim.mobject.types.vectorized_mobject import VMobject
 from manim.scene.scene_file_writer import SceneFileWriter
 from manim.utils.color import color_to_rgba
@@ -56,6 +56,7 @@ from .webgpu_vmobject_rendering import (
     build_true_dot_vbo,
     collect_frame_data,
     draw_frame_data,
+    draw_frame_data_subcam,
 )
 
 if TYPE_CHECKING:
@@ -169,6 +170,11 @@ class WebGPUCamera(Mobject):
         # so we provide equivalent stubs here.
         self._frame_center: Mobject = Mobject()
 
+        # ImageMobjectFromCamera registration — for ZoomedScene support.
+        # Each frame the renderer renders the sub-camera view into a dedicated
+        # GPU texture which is then composited as a regular image quad.
+        self.image_mobjects_from_cameras: list = []
+
     def get_value_trackers(self) -> list:
         """Required by ThreeDScene.get_moving_mobjects.
 
@@ -179,6 +185,21 @@ class WebGPUCamera(Mobject):
         motion.
         """
         return [self]
+
+    def get_mobjects_indicating_movement(self) -> list:
+        """Return mobjects whose movement implies the whole scene is moving.
+
+        Called by :class:`~.MovingCameraScene` to detect whether the camera
+        frame (or any registered sub-camera frame) is animated, which forces
+        all scene mobjects to be treated as moving so the static-frame
+        optimisation is skipped.
+
+        Mirrors ``MultiCamera.get_mobjects_indicating_movement`` so that
+        :class:`~.ZoomedScene` works with the WebGPU renderer.
+        """
+        return [
+            imfc.camera.frame for imfc in self.image_mobjects_from_cameras
+        ]
 
     # ------------------------------------------------------------------
     # Frame geometry helpers (mirrors OpenGLCamera)
@@ -456,6 +477,24 @@ class WebGPUCamera(Mobject):
         """Unregister mobjects previously added with add_fixed_orientation_mobjects."""
         self.fixed_orientation_mobjects.difference_update(mobjects)
 
+    def add_image_mobject_from_camera(self, image_mob_from_camera: Any) -> None:
+        """Register an ImageMobjectFromCamera for sub-camera rendering.
+
+        Called by :class:`~.ZoomedScene` when zooming is activated.  Each
+        registered mob is rendered from its associated ``MovingCamera``'s
+        perspective into a dedicated GPU texture every frame.
+
+        **WebGPU renderer only** — this method is a no-op for Cairo / OpenGL.
+        """
+        if image_mob_from_camera not in self.image_mobjects_from_cameras:
+            self.image_mobjects_from_cameras.append(image_mob_from_camera)
+
+    def remove_image_mobject_from_camera(self, image_mob_from_camera: Any) -> None:
+        """Unregister an ImageMobjectFromCamera previously added via
+        ``add_image_mobject_from_camera``."""
+        if image_mob_from_camera in self.image_mobjects_from_cameras:
+            self.image_mobjects_from_cameras.remove(image_mob_from_camera)
+
 
 # ---------------------------------------------------------------------------
 # Main renderer class
@@ -542,6 +581,17 @@ class WebGPURenderer:
         # TrueDot pipeline (true_dot.wgsl) — renders DotCloud3D/PointDot as
         # screen-aligned lit sphere quads (CPU-expanded, 6 verts per dot).
         self._true_dot_pipeline: wgpu_t.GPURenderPipeline | None = None
+
+        # Sub-camera pipelines — identical to the main pipelines but target
+        # rgba8unorm instead of bgra8unorm so the rendered texture can be
+        # sampled by the image pipeline without B↔R channel confusion.
+        # Used for ImageMobjectFromCamera (ZoomedScene support).
+        self._sub_cam_fill_stroke_pipeline: wgpu_t.GPURenderPipeline | None = None
+        self._sub_cam_fill_stroke_3d_pipeline: wgpu_t.GPURenderPipeline | None = None
+        self._sub_cam_surface_pipeline: wgpu_t.GPURenderPipeline | None = None
+        # Per-mob GPU resource cache: mob id → dict with render texture,
+        # depth texture, uniform buffer, camera bind group, tex bind group.
+        self._sub_cam_resources: dict[int, dict] = {}
 
         # Image pipeline (image.wgsl) — renders ImageMobject pixel arrays as
         # textured quads before the VMobject pass (painter's algorithm).
@@ -679,6 +729,17 @@ class WebGPURenderer:
         self._image_tex_bgl, self._image_pipeline = self._create_image_pipeline()
         self._true_dot_pipeline = self._create_true_dot_pipeline(self._proj_bgl)
 
+        # Sub-camera pipelines (rgba8unorm target) for ZoomedScene support.
+        _, self._sub_cam_fill_stroke_pipeline = self._create_fill_stroke_pipeline(
+            depth_test=False, target_format="rgba8unorm"
+        )
+        _, self._sub_cam_fill_stroke_3d_pipeline = self._create_fill_stroke_pipeline(
+            depth_test=True, target_format="rgba8unorm"
+        )
+        self._sub_cam_surface_pipeline = self._create_surface_pipeline(
+            self._proj_bgl, cull_mode="none", depth_write=True, target_format="rgba8unorm"
+        )
+
         # Persistent camera uniform buffers — created once, updated each frame via
         # write_buffer.  Using COPY_DST so queue.write_buffer can write into them.
         # These stable GPU objects let cached _FrameData bind groups remain valid
@@ -744,6 +805,7 @@ class WebGPURenderer:
     def _create_fill_stroke_pipeline(
         self,
         depth_test: bool = False,
+        target_format: str = "bgra8unorm",
     ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
         """Create the combined fill+stroke pipeline (vmobject_fill_stroke.wgsl).
 
@@ -798,7 +860,7 @@ class WebGPURenderer:
             fragment={
                 "module": shader_module,
                 "entry_point": "fs_main",
-                "targets": [{"format": wgpu.TextureFormat.bgra8unorm, "blend": _blend}],
+                "targets": [{"format": getattr(wgpu.TextureFormat, target_format), "blend": _blend}],
             },
             primitive={"topology": "triangle-list", "cull_mode": "none"},
             depth_stencil={
@@ -863,6 +925,7 @@ class WebGPURenderer:
         proj_bgl: wgpu_t.GPUBindGroupLayout,
         cull_mode: str = "none",
         depth_write: bool = True,
+        target_format: str = "bgra8unorm",
     ) -> wgpu_t.GPURenderPipeline:
         """Create a surface (mesh) pipeline.
 
@@ -905,7 +968,7 @@ class WebGPURenderer:
             fragment={
                 "module": shader_module,
                 "entry_point": "fs_main",
-                "targets": [{"format": wgpu.TextureFormat.bgra8unorm, "blend": _blend}],
+                "targets": [{"format": getattr(wgpu.TextureFormat, target_format), "blend": _blend}],
             },
             primitive={"topology": "triangle-list", "cull_mode": cull_mode},
             depth_stencil={
@@ -1388,6 +1451,197 @@ class WebGPURenderer:
 
         return proj_bytes + view_bytes + header + light_data
 
+    # ------------------------------------------------------------------
+    # Sub-camera rendering (ZoomedScene / ImageMobjectFromCamera)
+    # ------------------------------------------------------------------
+
+    def _sub_camera_proj_view(self, sub_cam_frame: Any) -> tuple[np.ndarray, np.ndarray]:
+        """Return (proj, view) matrices for a MovingCamera's frame viewport.
+
+        The sub-camera is always orthographic.  Its viewport is defined by the
+        ``frame`` mobject's current center and size.
+        """
+        fw   = float(sub_cam_frame.get_width())
+        fh   = float(sub_cam_frame.get_height())
+        cen  = sub_cam_frame.get_center()
+        cx, cy = float(cen[0]), float(cen[1])
+        near, far = -100.0, 100.0
+
+        # Orthographic projection using the sub-camera's frame dimensions
+        # (centered at origin — the view matrix handles the translation).
+        proj = np.array(
+            [
+                [2.0 / fw, 0.0,       0.0,                  0.0],
+                [0.0,      2.0 / fh,  0.0,                  0.0],
+                [0.0,      0.0,      -1.0 / (far - near),   far / (far - near)],
+                [0.0,      0.0,       0.0,                  1.0],
+            ],
+            dtype=np.float32,
+        )
+
+        # View: translate the world so frame center lands at the origin.
+        view = np.eye(4, dtype=np.float32)
+        view[0, 3] = -cx
+        view[1, 3] = -cy
+        view[2, 3] = -float(self.camera.focal_distance)
+        return proj, view
+
+    def _get_sub_cam_resources(self, mob: Any) -> dict:
+        """Return (and lazily create) per-mob GPU resources for sub-camera rendering.
+
+        Returns a dict with keys:
+          render_tex, render_view  — rgba8unorm render target (RENDER_ATTACHMENT | TEXTURE_BINDING)
+          depth_tex,  depth_view   — depth24plus depth buffer
+          uniform_buf              — 656-byte camera uniform buffer (COPY_DST | UNIFORM)
+          cam_bg                   — camera-only bind group (proj_bgl, binding 0 = uniform_buf)
+          tex_bg                   — image display bind group (image_tex_bgl, binding 0 = render_view)
+        """
+        assert self._device is not None
+        assert self._proj_bgl is not None
+        assert self._image_tex_bgl is not None
+
+        mob_id = id(mob)
+        if mob_id in self._sub_cam_resources:
+            return self._sub_cam_resources[mob_id]
+
+        w, h = config.pixel_width, config.pixel_height
+        _UBO_SIZE = 656
+
+        render_tex = self._device.create_texture(
+            size=(w, h, 1),
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING,
+        )
+        render_view = render_tex.create_view()
+
+        depth_tex = self._device.create_texture(
+            size=(w, h, 1),
+            format=wgpu.TextureFormat.depth24plus,
+            usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+        )
+        depth_view = depth_tex.create_view()
+
+        uniform_buf = self._device.create_buffer(
+            size=_UBO_SIZE,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        cam_bg = self._device.create_bind_group(
+            layout=self._proj_bgl,
+            entries=[{"binding": 0, "resource": {"buffer": uniform_buf, "offset": 0, "size": _UBO_SIZE}}],
+        )
+
+        sampler = self._device.create_sampler(
+            min_filter="linear",
+            mag_filter="linear",
+            address_mode_u="clamp-to-edge",
+            address_mode_v="clamp-to-edge",
+        )
+        tex_bg = self._device.create_bind_group(
+            layout=self._image_tex_bgl,
+            entries=[
+                {"binding": 0, "resource": render_view},
+                {"binding": 1, "resource": sampler},
+            ],
+        )
+
+        resources = {
+            "render_tex":  render_tex,
+            "render_view": render_view,
+            "depth_tex":   depth_tex,
+            "depth_view":  depth_view,
+            "uniform_buf": uniform_buf,
+            "cam_bg":      cam_bg,
+            "tex_bg":      tex_bg,
+        }
+        self._sub_cam_resources[mob_id] = resources
+        return resources
+
+    def _render_sub_camera_pass(
+        self,
+        mob: Any,
+        encoder: Any,
+        normal_fds: list,
+    ) -> None:
+        """Render a sub-camera view for *mob* (an ImageMobjectFromCamera).
+
+        The sub-camera's view of the main scene is drawn into the mob's
+        persistent rgba8unorm render texture using sub-camera pipelines.
+        The result is available as ``resources["tex_bg"]`` in the same frame.
+
+        Parameters
+        ----------
+        mob
+            An ``ImageMobjectFromCamera`` instance with a ``camera`` attribute
+            that is a ``MovingCamera``.
+        encoder
+            Active ``GPUCommandEncoder`` (compute pass must already be ended).
+        normal_fds
+            List of ``_FrameData`` objects from the main frame's normal-camera
+            render queue.  The same GPU geometry buffers are reused here with
+            a different camera uniform.
+        """
+        assert self._device is not None
+        assert self._fill_stroke_bgl is not None
+        assert self._sub_cam_fill_stroke_pipeline is not None
+        assert self._sub_cam_fill_stroke_3d_pipeline is not None
+        assert self._sub_cam_surface_pipeline is not None
+
+        sub_cam_frame = mob.camera.frame
+        proj, view = self._sub_camera_proj_view(sub_cam_frame)
+        ubo_bytes   = self._pack_camera_uniforms_bytes(proj, view)
+
+        res = self._get_sub_cam_resources(mob)
+        self._device.queue.write_buffer(res["uniform_buf"], 0, ubo_bytes)
+
+        bg = self._background_color
+
+        sub_pass = encoder.begin_render_pass(
+            color_attachments=[
+                {
+                    "view":        res["render_view"],
+                    "load_op":     "clear",
+                    "store_op":    "store",
+                    "clear_value": tuple(float(c) for c in bg),
+                }
+            ],
+            depth_stencil_attachment={
+                "view":              res["depth_view"],
+                "depth_clear_value": 1.0,
+                "depth_load_op":     "clear",
+                "depth_store_op":    "store",
+            },
+        )
+
+        for fd in normal_fds:
+            if fd is None:
+                continue
+            # Build a sub-camera bind group that combines the sub-camera
+            # uniform buffer (binding 0) with the same quads output buffer
+            # (binding 1) used in the main render.  This reuses the already-
+            # computed quadratic Bezier data without re-running the compute shader.
+            if fd.quads_out_buf is not None:
+                sub_fill_render_bg = self._device.create_bind_group(
+                    layout=self._fill_stroke_bgl,
+                    entries=[
+                        {"binding": 0, "resource": {"buffer": res["uniform_buf"], "offset": 0, "size": res["uniform_buf"].size}},
+                        {"binding": 1, "resource": {"buffer": fd.quads_out_buf,   "offset": 0, "size": fd.quads_out_buf.size}},
+                    ],
+                )
+            else:
+                sub_fill_render_bg = None
+
+            draw_frame_data_subcam(
+                sub_pass,
+                fd,
+                sub_fill_render_bg=sub_fill_render_bg,
+                sub_cam_bg=res["cam_bg"],
+                fill_2d_pipeline=self._sub_cam_fill_stroke_pipeline,
+                fill_3d_pipeline=self._sub_cam_fill_stroke_3d_pipeline,
+                surf_pipeline=self._sub_cam_surface_pipeline,
+            )
+
+        sub_pass.end()
+
     # Keep the old name as a shim so any external callers don't break.
     def _pack_camera_uniforms(self, proj: np.ndarray, view: np.ndarray) -> wgpu_t.GPUBuffer:
         """Create a throw-away 656-byte uniform buffer (legacy path, rarely used)."""
@@ -1636,14 +1890,24 @@ class WebGPURenderer:
         # command encoder starts.  Replace ('image', mob) queue items with
         # ('image', vbo, tex_bg) so the render loop has no CPU work left.
         # Similarly expand TrueDot mobs into vertex arrays and GPU buffers.
+        #
+        # ImageMobjectFromCamera mobs are handled specially: instead of reading
+        # their pixel_array (which is never populated by the WebGPU renderer),
+        # we use the pre-rendered sub-camera texture produced in Pass 0.5.
         resolved_queue: list[tuple] = []
         for item in render_queue:
             if item[0] == "image":
                 mob = item[1]
                 vbo = self._build_image_vbo(mob)
-                resources = self._get_image_gpu_resources(mob)
-                if vbo is not None and resources is not None:
-                    resolved_queue.append(("image", vbo, resources[1]))
+                if isinstance(mob, ImageMobjectFromCamera):
+                    res = self._sub_cam_resources.get(id(mob))
+                    tex_bg = res["tex_bg"] if res is not None else None
+                    if vbo is not None and tex_bg is not None:
+                        resolved_queue.append(("image", vbo, tex_bg))
+                else:
+                    resources = self._get_image_gpu_resources(mob)
+                    if vbo is not None and resources is not None:
+                        resolved_queue.append(("image", vbo, resources[1]))
             elif item[0] == "truedot":
                 mob = item[1]
                 arr = build_true_dot_vbo(mob)
@@ -1725,6 +1989,17 @@ class WebGPURenderer:
                 cp.set_bind_group(0, fd.compute_bg, [], 0, 0)
                 cp.dispatch_workgroups((fd.n_cubics_total + 63) // 64, 1, 1)
         cp.end()
+
+        # ── Pass 0.5: sub-camera render passes ───────────────────────────
+        # Render scene geometry into each ImageMobjectFromCamera's private
+        # rgba8unorm texture so it is ready to be sampled as an image in
+        # Pass 1.  These passes share the already-computed quads buffers
+        # from the compute pass above; no re-dispatch is needed.
+        if self.camera.image_mobjects_from_cameras:
+            normal_fds = [item[1] for item in resolved_queue if item[0] == "vmobs"]
+            for sub_mob in self.camera.image_mobjects_from_cameras:
+                self._get_sub_cam_resources(sub_mob)  # ensure resources created
+                self._render_sub_camera_pass(sub_mob, encoder, normal_fds)
 
         # ── Pass 1: main render ───────────────────────────────────────────
         # Draw the z-ordered render queue (VMobject batches and images

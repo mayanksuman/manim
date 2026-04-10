@@ -815,6 +815,128 @@ def draw_frame_data(
             rp.draw(run_vertex_count, 1, run_first_vertex, 0)
 
 
+def draw_frame_data_subcam(
+    rp: Any,
+    fd: _FrameData,
+    sub_fill_render_bg: Any,
+    sub_cam_bg: Any,
+    fill_2d_pipeline: Any,
+    fill_3d_pipeline: Any,
+    surf_pipeline: Any,
+) -> None:
+    """Draw *fd* into render pass *rp* using sub-camera pipelines and bind groups.
+
+    Mirrors ``draw_frame_data`` but accepts explicit pipeline objects and bind
+    groups instead of reading them from the renderer.  Used by
+    ``_render_sub_camera_pass`` to reuse cached geometry (quads buffer, vertex
+    buffer, surface buffer) with a different camera uniform.
+
+    Parameters
+    ----------
+    rp
+        Active render pass encoder targeting the sub-camera texture.
+    fd
+        Cached geometry from the main frame's ``collect_frame_data`` call.
+    sub_fill_render_bg
+        Bind group with sub-camera uniform (binding 0) + quads storage (binding 1).
+        Replaces ``fd.render_bg`` for fill-stroke draw calls.
+    sub_cam_bg
+        Camera-only bind group with sub-camera uniform (binding 0).
+        Used for surface draw calls.
+    fill_2d_pipeline / fill_3d_pipeline / surf_pipeline
+        Sub-camera render pipelines targeting the sub-camera texture format.
+    """
+    # ── 2-D fill+stroke ───────────────────────────────────────────────────
+    if fd.fs_buf is not None and sub_fill_render_bg is not None:
+        rp.set_pipeline(fill_2d_pipeline)
+        rp.set_bind_group(0, sub_fill_render_bg, [], 0, 0)
+        rp.set_vertex_buffer(0, fd.fs_buf)
+
+        run_first_vertex: int = -1
+        run_vertex_count: int = 0
+        for cmd, idx in fd.draw_plan:
+            if cmd != "fill_stroke_2d":
+                if run_vertex_count > 0:
+                    rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                    run_vertex_count = 0
+                    run_first_vertex = -1
+                continue
+            arr         = fd.fs_parts[idx]
+            byte_offset = fd.fs_byte_offsets[idx]
+            first_vert  = byte_offset // _FILL_STROKE_STRIDE
+            if run_first_vertex < 0:
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+            elif first_vert == run_first_vertex + run_vertex_count:
+                run_vertex_count += len(arr)
+            else:
+                rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+        if run_vertex_count > 0:
+            rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+
+    # ── 3-D fill+stroke ───────────────────────────────────────────────────
+    if fd.fs_buf is not None and sub_fill_render_bg is not None:
+        rp.set_pipeline(fill_3d_pipeline)
+        rp.set_bind_group(0, sub_fill_render_bg, [], 0, 0)
+        rp.set_vertex_buffer(0, fd.fs_buf)
+
+        run_first_vertex = -1
+        run_vertex_count = 0
+        for cmd, idx in fd.draw_plan:
+            if cmd != "fill_stroke_3d":
+                if run_vertex_count > 0:
+                    rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                    run_vertex_count = 0
+                    run_first_vertex = -1
+                continue
+            arr         = fd.fs_parts[idx]
+            byte_offset = fd.fs_byte_offsets[idx]
+            first_vert  = byte_offset // _FILL_STROKE_STRIDE
+            if run_first_vertex < 0:
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+            elif first_vert == run_first_vertex + run_vertex_count:
+                run_vertex_count += len(arr)
+            else:
+                rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+        if run_vertex_count > 0:
+            rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+
+    # ── Opaque surfaces ───────────────────────────────────────────────────
+    if fd.surface_buf is not None and surf_pipeline is not None:
+        rp.set_pipeline(surf_pipeline)
+        rp.set_bind_group(0, sub_cam_bg, [], 0, 0)
+        rp.set_vertex_buffer(0, fd.surface_buf)
+
+        run_first_vertex = -1
+        run_vertex_count = 0
+        for cmd, idx in fd.draw_plan:
+            if cmd != "surface_opaque":
+                if run_vertex_count > 0:
+                    rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                    run_vertex_count = 0
+                    run_first_vertex = -1
+                continue
+            arr         = fd.surface_parts[idx]
+            byte_offset = fd.surface_byte_offsets[idx]
+            first_vert  = byte_offset // _SURFACE_COMBINED_STRIDE
+            if run_first_vertex < 0:
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+            elif first_vert == run_first_vertex + run_vertex_count:
+                run_vertex_count += len(arr)
+            else:
+                rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+                run_first_vertex = first_vert
+                run_vertex_count = len(arr)
+        if run_vertex_count > 0:
+            rp.draw(run_vertex_count, 1, run_first_vertex, 0)
+
+
 # ---------------------------------------------------------------------------
 # GPU upload helpers
 # ---------------------------------------------------------------------------

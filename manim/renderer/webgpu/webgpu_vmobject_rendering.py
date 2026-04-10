@@ -59,28 +59,32 @@ if TYPE_CHECKING:
 # Combined surface vertex layout — must match surface_combined.wgsl /
 # surface_oit.wgsl locations.
 #
-#   location 0 — in_vert          float32x3  offset  0  (12 B)
-#   location 1 — in_normal        float32x3  offset 12  (12 B)
-#   location 2 — in_fill_color    float32x4  offset 24  (16 B)
-#   location 3 — in_stroke_color  float32x4  offset 40  (16 B)
-#   location 4 — in_bary          float32x3  offset 56  (12 B)
-#   location 5 — stroke_half_px   float32    offset 68  ( 4 B)
-#   stride: 72 bytes
+#   location 0 — in_vert            float32x3  offset  0  (12 B)
+#   location 1 — in_normal          float32x3  offset 12  (12 B)
+#   location 2 — in_fill_color      float32x4  offset 24  (16 B)
+#   location 3 — in_stroke_color    float32x4  offset 40  (16 B)
+#   location 4 — in_bary            float32x3  offset 56  (12 B)
+#   location 5 — stroke_half_px     float32    offset 68  ( 4 B)
+#   location 6 — diffuse_strength   float32    offset 72  ( 4 B)
+#   location 7 — specular_strength  float32    offset 76  ( 4 B)
+#   location 8 — specular_exponent  float32    offset 80  ( 4 B)
+#   stride: 84 bytes
 # ---------------------------------------------------------------------------
 
 _SURFACE_COMBINED_DTYPE = np.dtype(
     [
-        ("in_vert",           np.float32, (3,)),
-        ("in_normal",         np.float32, (3,)),
-        ("in_fill_color",     np.float32, (4,)),
-        ("in_stroke_color",   np.float32, (4,)),
-        ("in_bary",           np.float32, (3,)),
-        ("stroke_half_px",    np.float32),
-        ("diffuse_strength",  np.float32),
-        ("specular_strength", np.float32),
+        ("in_vert",            np.float32, (3,)),
+        ("in_normal",          np.float32, (3,)),
+        ("in_fill_color",      np.float32, (4,)),
+        ("in_stroke_color",    np.float32, (4,)),
+        ("in_bary",            np.float32, (3,)),
+        ("stroke_half_px",     np.float32),
+        ("diffuse_strength",   np.float32),
+        ("specular_strength",  np.float32),
+        ("specular_exponent",  np.float32),
     ]
 )
-_SURFACE_COMBINED_STRIDE: int = _SURFACE_COMBINED_DTYPE.itemsize  # 80 bytes
+_SURFACE_COMBINED_STRIDE: int = _SURFACE_COMBINED_DTYPE.itemsize  # 84 bytes
 
 _SURFACE_COMBINED_OFFSETS: dict[str, int] = {
     name: _SURFACE_COMBINED_DTYPE.fields[name][1]  # type: ignore[index]
@@ -91,14 +95,15 @@ SURFACE_COMBINED_VERTEX_LAYOUT: dict = {
     "array_stride": _SURFACE_COMBINED_STRIDE,
     "step_mode": "vertex",
     "attributes": [
-        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_vert"],           "shader_location": 0},
-        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_normal"],         "shader_location": 1},
-        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_fill_color"],     "shader_location": 2},
-        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_stroke_color"],   "shader_location": 3},
-        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_bary"],           "shader_location": 4},
-        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["stroke_half_px"],    "shader_location": 5},
-        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["diffuse_strength"],  "shader_location": 6},
-        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["specular_strength"], "shader_location": 7},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_vert"],            "shader_location": 0},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_normal"],          "shader_location": 1},
+        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_fill_color"],      "shader_location": 2},
+        {"format": "float32x4", "offset": _SURFACE_COMBINED_OFFSETS["in_stroke_color"],    "shader_location": 3},
+        {"format": "float32x3", "offset": _SURFACE_COMBINED_OFFSETS["in_bary"],            "shader_location": 4},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["stroke_half_px"],     "shader_location": 5},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["diffuse_strength"],   "shader_location": 6},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["specular_strength"],  "shader_location": 7},
+        {"format": "float32",   "offset": _SURFACE_COMBINED_OFFSETS["specular_exponent"],  "shader_location": 8},
     ],
 }
 
@@ -455,12 +460,22 @@ def collect_frame_data(
             surface_submobs = mob.family_members_with_points()
             if use_z_index:
                 surface_submobs = sorted(surface_submobs, key=lambda m: m.z_index)
+            # Read material params from the parent Surface as defaults; each
+            # submobject patch may override them individually by carrying its
+            # own diffuse_strength / specular_strength / specular_exponent
+            # instance attribute (set via set_*_by_func or direct assignment).
+            surf_diffuse  = float(getattr(mob, "diffuse_strength",  0.8))
+            surf_specular = float(getattr(mob, "specular_strength", 0.9))
+            surf_spec_exp = float(getattr(mob, "specular_exponent", 16.0))
             for submob in surface_submobs:
                 if id(submob) in _seen_submobs:
                     continue
                 _seen_submobs.add(id(submob))
                 data = _collect_surface_geometry(
-                    submob, view_matrix, proj_matrix
+                    submob, view_matrix, proj_matrix,
+                    diffuse_strength  = float(getattr(submob, "diffuse_strength",  surf_diffuse)),
+                    specular_strength = float(getattr(submob, "specular_strength", surf_specular)),
+                    specular_exponent = float(getattr(submob, "specular_exponent", surf_spec_exp)),
                 )
                 if data is not None:
                     cls = _surface_opacity_class(data)
@@ -1151,8 +1166,16 @@ def _collect_surface_geometry(
     vmobject: VMobject,
     view_matrix: np.ndarray,
     proj_matrix: np.ndarray,
+    diffuse_strength: float = 0.8,
+    specular_strength: float = 0.9,
+    specular_exponent: float = 16.0,
 ) -> np.ndarray | None:
     """Return a ``_SURFACE_COMBINED_DTYPE`` array for a shade_in_3d VMobject.
+
+    Material parameters are passed from the parent :class:`~.Surface` so
+    that ``diffuse_strength``, ``specular_strength``, and
+    ``specular_exponent`` set on the parent are applied to every submobject
+    patch.
 
     Barycentric coordinates are assigned per triangle in the centroid fan:
       centroid     → bary = (1, 0, 0)   (bary.x = 0 on outer edge)
@@ -1245,18 +1268,16 @@ def _collect_surface_geometry(
         stroke_half_ndc = float(0.004 * stroke_width * abs(pm[0, 0]) / abs(avg_clip_w))
         stroke_half_px  = stroke_half_ndc * config.pixel_width * 0.5
 
-    diffuse_strength  = float(getattr(vmobject, "diffuse_strength",  0.8))
-    specular_strength = float(getattr(vmobject, "specular_strength", 0.9))
-
     attrs = np.empty(n_total, dtype=_SURFACE_COMBINED_DTYPE)
-    attrs["in_vert"]           = verts
-    attrs["in_normal"]         = normals
-    attrs["in_fill_color"]     = fill_color
-    attrs["in_stroke_color"]   = stroke_color
-    attrs["in_bary"]           = bary
-    attrs["stroke_half_px"]    = stroke_half_px
-    attrs["diffuse_strength"]  = diffuse_strength
-    attrs["specular_strength"] = specular_strength
+    attrs["in_vert"]            = verts
+    attrs["in_normal"]          = normals
+    attrs["in_fill_color"]      = fill_color
+    attrs["in_stroke_color"]    = stroke_color
+    attrs["in_bary"]            = bary
+    attrs["stroke_half_px"]     = stroke_half_px
+    attrs["diffuse_strength"]   = float(diffuse_strength)
+    attrs["specular_strength"]  = float(specular_strength)
+    attrs["specular_exponent"]  = float(specular_exponent)
     return attrs
 
 

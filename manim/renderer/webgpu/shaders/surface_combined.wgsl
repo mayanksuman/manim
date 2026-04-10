@@ -22,15 +22,16 @@
 //
 // Compositing: wireframe stroke "over" Phong fill (Porter-Duff).
 //
-// Vertex layout (must match _SURFACE_COMBINED_DTYPE, stride 80 bytes):
-//   location 0 — in_vert           float32x3  offset  0
-//   location 1 — in_normal         float32x3  offset 12
-//   location 2 — in_fill_color     float32x4  offset 24
-//   location 3 — in_stroke_color   float32x4  offset 40
-//   location 4 — in_bary           float32x3  offset 56
-//   location 5 — stroke_half_px    float32    offset 68
-//   location 6 — diffuse_strength  float32    offset 72
-//   location 7 — specular_strength float32    offset 76
+// Vertex layout (must match _SURFACE_COMBINED_DTYPE, stride 84 bytes):
+//   location 0 — in_vert            float32x3  offset  0
+//   location 1 — in_normal          float32x3  offset 12
+//   location 2 — in_fill_color      float32x4  offset 24
+//   location 3 — in_stroke_color    float32x4  offset 40
+//   location 4 — in_bary            float32x3  offset 56
+//   location 5 — stroke_half_px     float32    offset 68
+//   location 6 — diffuse_strength   float32    offset 72
+//   location 7 — specular_strength  float32    offset 76
+//   location 8 — specular_exponent  float32    offset 80
 
 // ── Lighting uniform layout (656 bytes total) ─────────────────────────────
 //
@@ -77,14 +78,15 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> u : Uniforms;
 
 struct VertexInput {
-    @location(0) in_vert           : vec3<f32>,
-    @location(1) in_normal         : vec3<f32>,
-    @location(2) in_fill_color     : vec4<f32>,
-    @location(3) in_stroke_color   : vec4<f32>,
-    @location(4) in_bary           : vec3<f32>,
-    @location(5) stroke_half_px    : f32,
-    @location(6) diffuse_strength  : f32,
-    @location(7) specular_strength : f32,
+    @location(0) in_vert            : vec3<f32>,
+    @location(1) in_normal          : vec3<f32>,
+    @location(2) in_fill_color      : vec4<f32>,
+    @location(3) in_stroke_color    : vec4<f32>,
+    @location(4) in_bary            : vec3<f32>,
+    @location(5) stroke_half_px     : f32,
+    @location(6) diffuse_strength   : f32,
+    @location(7) specular_strength  : f32,
+    @location(8) specular_exponent  : f32,
 };
 
 struct VertexOutput {
@@ -97,6 +99,7 @@ struct VertexOutput {
     @location(5) @interpolate(flat) v_stroke_half  : f32,
     @location(6) @interpolate(flat) v_diffuse      : f32,
     @location(7) @interpolate(flat) v_specular     : f32,
+    @location(8) @interpolate(flat) v_spec_exp     : f32,
 };
 
 @vertex
@@ -113,6 +116,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.v_stroke_half  = in.stroke_half_px;
     out.v_diffuse      = in.diffuse_strength;
     out.v_specular     = in.specular_strength;
+    out.v_spec_exp     = in.specular_exponent;
     return out;
 }
 
@@ -124,8 +128,9 @@ fn compute_lighting(
     base_rgb    : vec3<f32>,
     diff_str    : f32,
     spec_str    : f32,
+    spec_exp    : f32,
 ) -> vec3<f32> {
-    let specular_exp = 16.0;
+    let specular_exp = spec_exp;
     let view_dir     = normalize(-view_pos);
     let view3        = mat3x3<f32>(u.view[0].xyz, u.view[1].xyz, u.view[2].xyz);
 
@@ -200,7 +205,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     let lit_rgb = compute_lighting(
         in.v_view_pos, norm,
         in.v_fill_color.rgb,
-        diffuse_strength, specular_strength,
+        diffuse_strength, specular_strength, in.v_spec_exp,
     );
     let fill_a = in.v_fill_color.a;
 

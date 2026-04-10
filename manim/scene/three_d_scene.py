@@ -8,6 +8,8 @@ __all__ = ["ThreeDScene", "SpecialThreeDScene"]
 import warnings
 from collections.abc import Iterable, Sequence
 
+from manim.mobject.three_d.light_source import AmbientLight, LightSource
+
 import numpy as np
 
 from manim.mobject.geometry.line import Line
@@ -52,6 +54,26 @@ class ThreeDScene(Scene):
             default_angled_camera_orientation_kwargs
         )
         super().__init__(camera_class=camera_class, **kwargs)
+
+        # Default ambient light — exactly one is kept at all times.
+        # WebGPU renderer reads self.mobjects to find LightSource instances.
+        self._ambient_light = AmbientLight(intensity=0.5)
+        self.add(self._ambient_light)
+
+    def add(self, *mobjects):
+        """Override to enforce the single-ambient-light rule.
+
+        If the caller adds a new :class:`~.AmbientLight`, the existing one is
+        removed first so only one ambient light is ever in the scene.
+        """
+        for mob in mobjects:
+            if isinstance(mob, AmbientLight):
+                # Remove any existing AmbientLight before adding the new one.
+                existing = [m for m in self.mobjects if isinstance(m, AmbientLight)]
+                for old in existing:
+                    super().remove(old)
+                self._ambient_light = mob
+        return super().add(*mobjects)
 
     def set_camera_orientation(
         self,

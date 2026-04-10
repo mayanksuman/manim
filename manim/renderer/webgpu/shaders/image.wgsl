@@ -3,11 +3,11 @@
 // Renders a textured quad from four world-space corner vertices.
 // Used by WebGPURenderer to draw ImageMobject instances.
 //
-// Uniform layout (group 0, binding 0) — same 176-byte block as the VMobject
-// shader; only projection and view are used here:
+// Uniform layout (group 0, binding 0) — same 656-byte block as the surface
+// shaders; only projection and view are used here:
 //   offset  0 — projection  mat4x4<f32>  64 B
 //   offset 64 — view        mat4x4<f32>  64 B
-//   (remaining 48 bytes are lighting fields, unused by this shader)
+//   (remaining bytes are lighting fields, unused by this shader)
 //
 // Texture / sampler (group 1):
 //   binding 0 — texture_2d<f32>  (rgba8unorm uploaded as f32 [0,1] per channel)

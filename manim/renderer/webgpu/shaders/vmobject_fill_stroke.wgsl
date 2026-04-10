@@ -15,15 +15,11 @@
 // Objects with no fill: pass fill_color.a = 0 or n_fill_curves = 0.
 // Objects with no stroke: pass stroke_half_ndc = 0 or n_stroke_curves = 0.
 //
-// Uniform layout (group 0, binding 0) — 176-byte block shared with surface.wgsl:
-//   offset   0 — projection        mat4x4<f32>  (64 B)
-//   offset  64 — view              mat4x4<f32>  (64 B)
-//   offset 128 — light_pos         vec3<f32>    (12 B)  ← unused here
-//   offset 140 — light_intensity   f32          ( 4 B)  ← unused here
-//   offset 144 — light_color       vec3<f32>    (12 B)  ← unused here
-//   offset 156 — ambient_intensity f32          ( 4 B)  ← unused here
-//   offset 160 — ambient_color     vec3<f32>    (12 B)  ← unused here
-//   offset 172 — _pad              f32          ( 4 B)
+// Uniform layout (group 0, binding 0) — 656-byte block shared with surface shaders
+//   (only the first two fields are used here):
+//   offset   0 — projection  mat4x4<f32>  (64 B)
+//   offset  64 — view        mat4x4<f32>  (64 B)
+//   offset 128 — ...         (lighting data, unused by this shader)
 //
 // Storage buffer (group 0, binding 1) — array<f32>, 9 floats per quadratic:
 //   [p0.x p0.y p0.z  pmid.x pmid.y pmid.z  p2.x p2.y p2.z]
@@ -39,14 +35,8 @@
 //   location 7 — n_stroke_curves    uint32     offset 60
 
 struct Uniforms {
-    projection        : mat4x4<f32>,
-    view              : mat4x4<f32>,
-    light_pos         : vec3<f32>,
-    light_intensity   : f32,
-    light_color       : vec3<f32>,
-    ambient_intensity : f32,
-    ambient_color     : vec3<f32>,
-    _pad              : f32,
+    projection : mat4x4<f32>,
+    view       : mat4x4<f32>,
 };
 @group(0) @binding(0) var<uniform>        u     : Uniforms;
 @group(0) @binding(1) var<storage, read>  quads : array<f32>;

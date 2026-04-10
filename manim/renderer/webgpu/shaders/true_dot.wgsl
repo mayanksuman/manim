@@ -5,7 +5,8 @@
 // The fragment shader treats the quad as a sphere projected onto the screen:
 //   • Pixels outside the unit disc are discarded (anti-aliased edge).
 //   • The sphere normal is reconstructed from the UV position.
-//   • Cairo-style lighting (gloss/shadow) is applied to the colour.
+//   • Multi-light Phong shading is applied (same light array as surface shaders).
+//     gloss / shadow parameters blend the result toward the Cairo-style look.
 //
 // The same camera Uniforms struct and bind group layout as the surface
 // shaders are reused (binding 0, group 0).
@@ -18,15 +19,31 @@
 //   location 4 — gloss   float32    offset 40   ( 4 B)
 //   location 5 — shadow  float32    offset 44   ( 4 B)
 
+// ── Shared uniform (same layout as surface shaders, 656 bytes) ────────────────
+
+const MAX_LIGHTS : u32 = 8u;
+
+struct Light {
+    position   : vec3<f32>,
+    kind       : u32,
+    direction  : vec3<f32>,
+    intensity  : f32,
+    color      : vec3<f32>,
+    cone_angle : f32,
+    penumbra   : f32,
+    _pad0      : f32,
+    _pad1      : f32,
+    _pad2      : f32,
+};
+
 struct Uniforms {
-    projection        : mat4x4<f32>,
-    view              : mat4x4<f32>,
-    light_pos         : vec3<f32>,
-    light_intensity   : f32,
-    light_color       : vec3<f32>,
-    ambient_intensity : f32,
-    ambient_color     : vec3<f32>,
-    _pad              : f32,
+    projection : mat4x4<f32>,
+    view       : mat4x4<f32>,
+    num_lights : u32,
+    _pad0      : u32,
+    _pad1      : u32,
+    _pad2      : u32,
+    lights     : array<Light, 8>,
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 
@@ -54,9 +71,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let cv = u.view * vec4<f32>(in.center, 1.0);
 
     // Expand quad in view space: move corner by radius × UV along x/y.
-    // This replicates the OpenGL geometry shader expansion and naturally
-    // applies the correct perspective foreshortening (larger expansion near
-    // the camera, smaller far away).
     let expanded = cv + vec4<f32>(in.uv.x * in.radius, in.uv.y * in.radius, 0.0, 0.0);
 
     var out: VertexOutput;
@@ -73,31 +87,78 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let d = length(in.v_uv);
 
-    // Anti-aliased disc: smoothstep over one pixel width around d == 1.
-    let fw = fwidth(d);
+    // Anti-aliased disc edge.
+    let fw         = fwidth(d);
     let alpha_mult = 1.0 - smoothstep(1.0 - fw, 1.0 + fw, d);
     if alpha_mult <= 0.001 { discard; }
 
-    // Reconstruct sphere surface normal in view space from UV position.
-    let z2 = max(0.0, 1.0 - d * d);
+    // Reconstruct sphere surface normal in view space.
+    let z2           = max(0.0, 1.0 - d * d);
     let sphere_normal = normalize(vec3<f32>(in.v_uv.x, in.v_uv.y, sqrt(z2)));
+    let view_dir      = normalize(-in.v_center_view);
+    let view3         = mat3x3<f32>(u.view[0].xyz, u.view[1].xyz, u.view[2].xyz);
 
-    // Light and camera directions in view space.
-    // Camera sits at the origin in view space, so to_camera = -in.v_center_view.
-    let light_view = (u.view * vec4<f32>(u.light_pos, 1.0)).xyz;
-    let to_light   = normalize(light_view - in.v_center_view);
-    let to_camera  = normalize(-in.v_center_view);
+    // ── Multi-light accumulation ──────────────────────────────────────────
+    var acc_rgb = vec3<f32>(0.0);
 
-    // Cairo-style lighting (finalize_color.glsl → add_light):
-    //   shine     = gloss  * exp(-3 * (1 - dot(reflect(-L, N), V))^2)
-    //   darkening = mix(1, max(dot(L, N), 0), shadow)
-    //   out_rgb   = darkening * mix(color, WHITE, shine)
-    let light_reflection = reflect(-to_light, sphere_normal);
-    let dot_rv  = clamp(dot(light_reflection, to_camera), 0.0, 1.0);
-    let shine   = in.v_gloss * exp(-3.0 * pow(1.0 - dot_rv, 2.0));
-    let dp2     = dot(to_light, sphere_normal);
-    let darkening = mix(1.0, max(dp2, 0.0), in.v_shadow);
+    for (var i = 0u; i < u.num_lights; i++) {
+        let L = u.lights[i];
 
-    let lit_rgb = darkening * mix(in.v_color.rgb, vec3<f32>(1.0), shine);
-    return vec4<f32>(lit_rgb, in.v_color.a * alpha_mult);
+        switch L.kind {
+            // Ambient
+            case 0u: {
+                acc_rgb += in.v_color.rgb * L.color * L.intensity;
+            }
+            // Directional
+            case 1u: {
+                let to_light = normalize(-(view3 * L.direction));
+                let dot_ln   = clamp(dot(sphere_normal, to_light), 0.0, 1.0);
+                // Cairo-style shadow: darken by Lambertian term
+                let darkening = mix(1.0, dot_ln, in.v_shadow);
+                // Cairo-style specular gloss
+                let reflect_l = reflect(-to_light, sphere_normal);
+                let dot_rv    = clamp(dot(reflect_l, view_dir), 0.0, 1.0);
+                let shine     = in.v_gloss * exp(-3.0 * pow(1.0 - dot_rv, 2.0));
+                let lit = darkening * mix(in.v_color.rgb, vec3<f32>(1.0), shine);
+                acc_rgb += lit * L.color * L.intensity;
+            }
+            // Point
+            case 2u: {
+                let light_vpos = (u.view * vec4<f32>(L.position, 1.0)).xyz;
+                let light_dir_v = light_vpos - in.v_center_view;
+                let to_light   = normalize(light_dir_v);
+                let attenuation = L.intensity / dot(light_dir_v, light_dir_v);
+                let dot_ln     = clamp(dot(sphere_normal, to_light), 0.0, 1.0);
+                let darkening  = mix(1.0, dot_ln, in.v_shadow);
+                let reflect_l  = reflect(-to_light, sphere_normal);
+                let dot_rv     = clamp(dot(reflect_l, view_dir), 0.0, 1.0);
+                let shine      = in.v_gloss * exp(-3.0 * pow(1.0 - dot_rv, 2.0));
+                let lit        = darkening * mix(in.v_color.rgb, vec3<f32>(1.0), shine);
+                acc_rgb += lit * L.color * attenuation;
+            }
+            // Spot
+            case 3u: {
+                let light_vpos  = (u.view * vec4<f32>(L.position, 1.0)).xyz;
+                let light_dir_v = light_vpos - in.v_center_view;
+                let to_light    = normalize(light_dir_v);
+                let attenuation = L.intensity / dot(light_dir_v, light_dir_v);
+                let spot_dir    = normalize(view3 * L.direction);
+                let cos_theta   = dot(-to_light, spot_dir);
+                let cos_inner   = cos(radians(L.cone_angle));
+                let cos_outer   = cos(radians(L.cone_angle + L.penumbra));
+                let spot_factor = clamp((cos_theta - cos_outer) / (cos_inner - cos_outer + 1e-6), 0.0, 1.0);
+                let dot_ln      = clamp(dot(sphere_normal, to_light), 0.0, 1.0);
+                let darkening   = mix(1.0, dot_ln, in.v_shadow);
+                let reflect_l   = reflect(-to_light, sphere_normal);
+                let dot_rv      = clamp(dot(reflect_l, view_dir), 0.0, 1.0);
+                let shine       = in.v_gloss * exp(-3.0 * pow(1.0 - dot_rv, 2.0));
+                let lit         = darkening * mix(in.v_color.rgb, vec3<f32>(1.0), shine);
+                acc_rgb += lit * L.color * attenuation * spot_factor;
+            }
+            default: {}
+        }
+    }
+
+    let out_rgb = clamp(acc_rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(out_rgb, in.v_color.a * alpha_mult);
 }

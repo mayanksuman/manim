@@ -32,6 +32,7 @@ from PIL import Image
 from manim import config, logger
 from manim.constants import IN, OUT, PI, RIGHT, DOWN, LEFT
 from manim.mobject.mobject import Mobject
+from manim.mobject.three_d.light_source import LightSource
 from manim.mobject.types.image_mobject import AbstractImageMobject
 from manim.mobject.types.vectorized_mobject import VMobject
 from manim.scene.scene_file_writer import SceneFileWriter
@@ -506,14 +507,6 @@ class WebGPURenderer:
 
         self.background_color = config["background_color"]
 
-        # Scene-wide lighting — read by _build_camera_uniform_buf() each frame.
-        # light_color / ambient_color are RGB floats in [0, 1].
-        self.light_source_position: np.ndarray = np.array([10.0, 10.0, -10.0])
-        self.light_color: np.ndarray           = np.array([1.0, 1.0, 1.0])
-        self.light_intensity: float            = 300.0
-        self.ambient_color: np.ndarray         = np.array([1.0, 1.0, 1.0])
-        self.ambient_intensity: float          = 0.5
-
         # Filled by init_scene():
         self._device: wgpu_t.GPUDevice | None = None
         self._render_texture: wgpu_t.GPUTexture | None = None
@@ -691,16 +684,18 @@ class WebGPURenderer:
         # These stable GPU objects let cached _FrameData bind groups remain valid
         # across frames: the bind group references the same buffer; write_buffer
         # updates its contents so the shader always sees the current camera.
+        # Uniform buffer size: proj(64) + view(64) + num_lights+pad(16) + Light×8(512) = 656 B
+        _UBO_SIZE = 656
         self._camera_uniform_buf = self._device.create_buffer(
-            size=176,
+            size=_UBO_SIZE,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         self._fixed_orient_uniform_buf = self._device.create_buffer(
-            size=176,
+            size=_UBO_SIZE,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         self._fixed_frame_uniform_buf = self._device.create_buffer(
-            size=176,
+            size=_UBO_SIZE,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
 
@@ -709,7 +704,7 @@ class WebGPURenderer:
         def _make_persistent_bg(buf: wgpu_t.GPUBuffer) -> wgpu_t.GPUBindGroup:
             return self._device.create_bind_group(
                 layout=self._proj_bgl,
-                entries=[{"binding": 0, "resource": {"buffer": buf, "offset": 0, "size": 176}}],
+                entries=[{"binding": 0, "resource": {"buffer": buf, "offset": 0, "size": _UBO_SIZE}}],
             )
 
         self.camera_bind_group      = _make_persistent_bg(self._camera_uniform_buf)
@@ -727,15 +722,12 @@ class WebGPURenderer:
     def _create_camera_bgl(self) -> wgpu_t.GPUBindGroupLayout:
         """Create the bind group layout shared by stroke, surface, and Slug pipelines.
 
-        Layout: binding 0 — one uniform buffer (176 bytes total):
-          offset   0 — projection        mat4x4<f32>  64 B
-          offset  64 — view              mat4x4<f32>  64 B
-          offset 128 — light_pos         vec3<f32>    12 B
-          offset 140 — light_intensity   f32           4 B
-          offset 144 — light_color       vec3<f32>    12 B
-          offset 156 — ambient_intensity f32           4 B
-          offset 160 — ambient_color     vec3<f32>    12 B
-          offset 172 — _pad              f32           4 B
+        Layout: binding 0 — one uniform buffer (656 bytes total):
+          offset   0 — projection  mat4x4<f32>  64 B
+          offset  64 — view        mat4x4<f32>  64 B
+          offset 128 — num_lights  u32           4 B
+          offset 132 — _pad        u32 × 3      12 B
+          offset 144 — lights      Light × 8   512 B  (each Light = 64 B)
         """
         assert self._device is not None
         return self._device.create_bind_group_layout(
@@ -756,7 +748,7 @@ class WebGPURenderer:
         """Create the combined fill+stroke pipeline (vmobject_fill_stroke.wgsl).
 
         The bind group layout mirrors the slug fill layout:
-          binding 0 — camera uniform (176 bytes)
+          binding 0 — camera uniform (656 bytes)
           binding 1 — quads storage buffer (read-only, output of compute shader)
 
         depth_test=False — 2-D objects: depth-read-only (painter's algorithm).
@@ -1347,46 +1339,58 @@ class WebGPURenderer:
     # Camera bind group (rebuilt each frame when projection changes)
     # ------------------------------------------------------------------
 
+    def _collect_lights(self) -> list:
+        """Return all LightSource instances in the current scene (depth-first)."""
+        lights = []
+        if self.scene is None:
+            return lights
+        def _walk(mob):
+            if isinstance(mob, LightSource):
+                lights.append(mob)
+            for child in mob.submobjects:
+                _walk(child)
+        for mob in self.scene.mobjects:
+            _walk(mob)
+        return lights
+
+    _MAX_LIGHTS = 8
+
     def _pack_camera_uniforms_bytes(
         self,
         proj: np.ndarray,
         view: np.ndarray,
     ) -> bytes:
-        """Return a 176-byte camera+lighting uniform payload from explicit proj/view.
+        """Return a 656-byte camera+lighting uniform payload from explicit proj/view.
 
         Layout (matches Uniforms struct in surface_combined.wgsl / surface_oit.wgsl):
-          offset   0 — projection        mat4x4<f32>  64 B
-          offset  64 — view              mat4x4<f32>  64 B
-          offset 128 — light_pos         vec3<f32>    12 B
-          offset 140 — light_intensity   f32           4 B
-          offset 144 — light_color       vec3<f32>    12 B
-          offset 156 — ambient_intensity f32           4 B
-          offset 160 — ambient_color     vec3<f32>    12 B
-          offset 172 — _pad              f32           4 B
+          offset   0 — projection  mat4x4<f32>  64 B
+          offset  64 — view        mat4x4<f32>  64 B
+          offset 128 — num_lights  u32           4 B
+          offset 132 — _pad        u32 × 3      12 B
+          offset 144 — lights      Light × 8   512 B  (each Light = 64 B)
         """
         proj_bytes = proj.T.flatten().astype(np.float32).tobytes()
         view_bytes = view.T.flatten().astype(np.float32).tobytes()
 
-        # block A: light_pos (xyz) + light_intensity (w)
-        block_a = np.zeros(4, dtype=np.float32)
-        block_a[:3] = np.asarray(self.light_source_position, dtype=np.float32)
-        block_a[3]  = np.float32(self.light_intensity)
+        lights = self._collect_lights()
+        n = min(len(lights), self._MAX_LIGHTS)
 
-        # block B: light_color (xyz) + ambient_intensity (w)
-        block_b = np.zeros(4, dtype=np.float32)
-        block_b[:3] = np.asarray(self.light_color, dtype=np.float32)
-        block_b[3]  = np.float32(self.ambient_intensity)
+        # num_lights (u32) + 3× padding u32
+        header = np.array([n, 0, 0, 0], dtype=np.uint32).tobytes()
 
-        # block C: ambient_color (xyz) + _pad (w)
-        block_c = np.zeros(4, dtype=np.float32)
-        block_c[:3] = np.asarray(self.ambient_color, dtype=np.float32)
+        # Pack up to MAX_LIGHTS light structs; pad the rest with zeros.
+        light_data = b""
+        for i in range(self._MAX_LIGHTS):
+            if i < n:
+                light_data += lights[i].pack()
+            else:
+                light_data += b"\x00" * 64
 
-        return (proj_bytes + view_bytes
-                + block_a.tobytes() + block_b.tobytes() + block_c.tobytes())
+        return proj_bytes + view_bytes + header + light_data
 
     # Keep the old name as a shim so any external callers don't break.
     def _pack_camera_uniforms(self, proj: np.ndarray, view: np.ndarray) -> wgpu_t.GPUBuffer:
-        """Create a throw-away 176-byte uniform buffer (legacy path, rarely used)."""
+        """Create a throw-away 656-byte uniform buffer (legacy path, rarely used)."""
         assert self._device is not None
         buf = self._device.create_buffer_with_data(
             data=self._pack_camera_uniforms_bytes(proj, view),

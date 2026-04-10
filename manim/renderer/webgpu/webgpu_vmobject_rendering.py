@@ -375,7 +375,7 @@ def collect_frame_data(
     groups.  The caller must run the compute pass (via ``_FrameData.compute_bg``)
     before the render pass.
 
-    *camera_uniform_buf* is the 176-byte uniform buffer for this camera group.
+    *camera_uniform_buf* is the 656-byte uniform buffer for this camera group.
     It is stored in the render bind group so the fragment shader can project
     world-space curve data into the correct NDC space.
 
@@ -632,7 +632,7 @@ def collect_frame_data(
         render_bg = device.create_bind_group(
             layout=renderer._fill_stroke_bgl,
             entries=[
-                {"binding": 0, "resource": {"buffer": camera_uniform_buf, "offset": 0, "size": 176}},
+                {"binding": 0, "resource": {"buffer": camera_uniform_buf, "offset": 0, "size": camera_uniform_buf.size}},
                 {"binding": 1, "resource": {"buffer": quads_out_buf,      "offset": 0, "size": quads_out_buf.size}},
             ],
         )

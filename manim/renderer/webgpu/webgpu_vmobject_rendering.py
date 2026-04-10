@@ -119,7 +119,8 @@ SURFACE_COMBINED_VERTEX_LAYOUT: dict = {
 #   location 5 — n_fill_curves      uint32     offset 52   ( 4 B)
 #   location 6 — stroke_curve_start uint32     offset 56   ( 4 B)
 #   location 7 — n_stroke_curves    uint32     offset 60   ( 4 B)
-#   stride: 64 bytes
+#   location 8 — fill_rule          uint32     offset 64   ( 4 B)  0=nonzero, 1=evenodd
+#   stride: 68 bytes
 # ---------------------------------------------------------------------------
 
 _FILL_STROKE_DTYPE = np.dtype(
@@ -132,6 +133,7 @@ _FILL_STROKE_DTYPE = np.dtype(
         ("n_fill_curves",      np.uint32),
         ("stroke_curve_start", np.uint32),
         ("n_stroke_curves",    np.uint32),
+        ("fill_rule",          np.uint32),
     ]
 )
 _FILL_STROKE_STRIDE: int = _FILL_STROKE_DTYPE.itemsize  # 64 bytes
@@ -153,6 +155,7 @@ FILL_STROKE_VERTEX_LAYOUT: dict = {
         {"format": "uint32",    "offset": _FILL_STROKE_OFFSETS["n_fill_curves"],      "shader_location": 5},
         {"format": "uint32",    "offset": _FILL_STROKE_OFFSETS["stroke_curve_start"], "shader_location": 6},
         {"format": "uint32",    "offset": _FILL_STROKE_OFFSETS["n_stroke_curves"],    "shader_location": 7},
+        {"format": "uint32",    "offset": _FILL_STROKE_OFFSETS["fill_rule"],          "shader_location": 8},
     ],
 }
 
@@ -548,6 +551,19 @@ def collect_frame_data(
             if fill_color[3] < 0.001 and (stroke_color[3] < 0.001 or stroke_width < 0.001):
                 continue
 
+            # 0 = nonzero (default), 1 = evenodd (set by SVG parser)
+            fill_rule = int(getattr(submob, "fill_rule", 0))
+
+            # Gradient fill: pass all colour stops and gradient axis endpoints.
+            gradient_start = gradient_end = None
+            if fill_rgba.shape[0] > 1:
+                try:
+                    gradient_start, gradient_end = (
+                        submob.get_gradient_start_and_end_points()
+                    )
+                except Exception:
+                    pass  # fall back to solid fill_color[0]
+
             # Build bounding quad with placeholder curve indices.
             quad_verts = _build_fill_stroke_quad(
                 fill_cubics=fill_cubics,
@@ -559,6 +575,10 @@ def collect_frame_data(
                 stroke_curve_start=0,  # assigned below
                 view_matrix=view_matrix,
                 proj_matrix=proj_matrix,
+                fill_rule=fill_rule,
+                fill_rgbas=fill_rgba if fill_rgba.shape[0] > 1 else None,
+                gradient_start=gradient_start,
+                gradient_end=gradient_end,
             )
             if len(quad_verts) == 0:
                 continue
@@ -1062,6 +1082,10 @@ def _build_fill_stroke_quad(
     stroke_curve_start: int,
     view_matrix: np.ndarray,
     proj_matrix: np.ndarray,
+    fill_rule: int = 0,
+    fill_rgbas: np.ndarray | None = None,
+    gradient_start: np.ndarray | None = None,
+    gradient_end: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build a ``_FILL_STROKE_DTYPE`` bounding quad (6 vertices) for one object.
 
@@ -1073,6 +1097,9 @@ def _build_fill_stroke_quad(
     *stroke_half_ndc* is the stroke half-width in NDC units, computed from
     the current projection matrix and average clip-w so that stroke width is
     consistent across perspective depths.
+
+    *fill_rgbas* — if provided and has more than one row, enables gradient fill.
+    *gradient_start* / *gradient_end* — world-space endpoints of the gradient axis.
     """
     # Gather all anchor points (b0 and b3 of every cubic).
     anchor_lists: list[np.ndarray] = []
@@ -1137,18 +1164,54 @@ def _build_fill_stroke_quad(
     corners_w = (R_inv @ corners_v.T).T + t_inv  # (4, 3) world space
     quad_pos  = corners_w[[0, 1, 2, 1, 3, 2]]    # (6, 3) two CCW triangles
 
+    # ── Per-vertex fill colours (gradient support) ────────────────────────────
+    # If fill_rgbas has >1 colour row, interpolate along the gradient axis.
+    # gradient_start / gradient_end are world-space endpoints of the axis.
+    if (
+        fill_rgbas is not None
+        and fill_rgbas.shape[0] > 1
+        and gradient_start is not None
+        and gradient_end is not None
+    ):
+        gs = np.asarray(gradient_start, dtype=np.float32)
+        ge = np.asarray(gradient_end,   dtype=np.float32)
+        axis = ge - gs
+        axis_len2 = float(np.dot(axis, axis))
+        if axis_len2 > 1e-12:
+            # Project each of the 4 corners onto the gradient axis → t ∈ [0, 1].
+            t_corners = np.clip(
+                np.dot(corners_w - gs, axis) / axis_len2, 0.0, 1.0
+            )  # (4,)
+            n_stops = fill_rgbas.shape[0]
+            # Interpolate: t_corners maps to colour stop indices.
+            idx_f  = t_corners * (n_stops - 1)          # float indices
+            idx_lo = np.floor(idx_f).astype(int).clip(0, n_stops - 2)
+            idx_hi = idx_lo + 1
+            frac   = (idx_f - idx_lo)[:, None]           # (4, 1)
+            corner_colors = (
+                fill_rgbas[idx_lo].astype(np.float32) * (1.0 - frac)
+                + fill_rgbas[idx_hi].astype(np.float32) * frac
+            )  # (4, 4)
+            # Map corners [0,1,2,3] → quad vertices [0,1,2,1,3,2].
+            per_vertex_fill = corner_colors[[0, 1, 2, 1, 3, 2]]  # (6, 4)
+        else:
+            per_vertex_fill = np.broadcast_to(fill_color, (6, 4)).copy()
+    else:
+        per_vertex_fill = np.broadcast_to(fill_color, (6, 4)).copy()
+
     n_fill_quads   = len(fill_cubics)   * 4  # 4 quadratics per cubic
     n_stroke_quads = len(stroke_cubics) * 4
 
     verts = np.empty(6, dtype=_FILL_STROKE_DTYPE)
     verts["in_pos"]             = quad_pos
-    verts["in_fill_color"]      = fill_color
+    verts["in_fill_color"]      = per_vertex_fill
     verts["in_stroke_color"]    = stroke_color
     verts["stroke_half_ndc"]    = stroke_half_ndc
     verts["fill_curve_start"]   = fill_curve_start
     verts["n_fill_curves"]      = n_fill_quads
     verts["stroke_curve_start"] = stroke_curve_start
     verts["n_stroke_curves"]    = n_stroke_quads
+    verts["fill_rule"]          = fill_rule
     return verts
 
 

@@ -13,6 +13,16 @@
 //   binding 0 — texture_2d<f32>  (rgba8unorm uploaded as f32 [0,1] per channel)
 //   binding 1 — sampler          (linear, clamp-to-edge)
 //
+//   UV origin is top-left (matches WebGPU texture layout and Manim pixel_array
+//   row-major order: row 0 = top).  No y-flip is needed.
+//
+// Tint uniform (group 2, binding 0) — 16-byte block:
+//   offset  0 — rgb   vec3<f32>  12 B   per-channel colour multiplier
+//   offset 12 — _pad  f32         4 B   alignment padding (unused)
+//
+//   Default white (1, 1, 1) is identity — texture is returned unchanged.
+//   Set via mob.color; populated by the renderer from mob.color.to_rgb().
+//
 // Vertex attributes (stride 20 bytes):
 //   location 0 — in_pos  float32x3  offset  0
 //   location 1 — in_uv   float32x2  offset 12
@@ -25,6 +35,12 @@ struct Uniforms {
 
 @group(1) @binding(0) var img_texture : texture_2d<f32>;
 @group(1) @binding(1) var img_sampler : sampler;
+
+struct TintUniforms {
+    rgb  : vec3<f32>,
+    _pad : f32,
+};
+@group(2) @binding(0) var<uniform> tint : TintUniforms;
 
 struct VertexInput {
     @location(0) in_pos : vec3<f32>,
@@ -46,5 +62,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(img_texture, img_sampler, in.uv);
+    let sample = textureSample(img_texture, img_sampler, in.uv);
+    // Multiply RGB by the tint; alpha is taken from the texture as-is.
+    return vec4<f32>(sample.rgb * tint.rgb, sample.a);
 }

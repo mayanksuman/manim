@@ -24,7 +24,7 @@
 // Storage buffer (group 0, binding 1) — array<f32>, 9 floats per quadratic:
 //   [p0.x p0.y p0.z  pmid.x pmid.y pmid.z  p2.x p2.y p2.z]
 //
-// Vertex attributes (must match _FILL_STROKE_DTYPE, stride 64 bytes):
+// Vertex attributes (must match _FILL_STROKE_DTYPE, stride 68 bytes):
 //   location 0 — in_pos             float32x3  offset  0
 //   location 1 — in_fill_color      float32x4  offset 12
 //   location 2 — in_stroke_color    float32x4  offset 28
@@ -33,6 +33,7 @@
 //   location 5 — n_fill_curves      uint32     offset 52
 //   location 6 — stroke_curve_start uint32     offset 56
 //   location 7 — n_stroke_curves    uint32     offset 60
+//   location 8 — fill_rule          uint32     offset 64  (0=nonzero, 1=evenodd)
 
 struct Uniforms {
     projection : mat4x4<f32>,
@@ -50,6 +51,7 @@ struct VertexInput {
     @location(5) n_fill_curves      : u32,
     @location(6) stroke_curve_start : u32,
     @location(7) n_stroke_curves    : u32,
+    @location(8) fill_rule          : u32,
 };
 
 struct VertexOutput {
@@ -62,6 +64,7 @@ struct VertexOutput {
     @location(5) @interpolate(flat) n_fill_curves     : u32,
     @location(6) @interpolate(flat) stroke_curve_start: u32,
     @location(7) @interpolate(flat) n_stroke_curves   : u32,
+    @location(8) @interpolate(flat) fill_rule         : u32,
 };
 
 @vertex
@@ -80,6 +83,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.n_fill_curves      = in.n_fill_curves;
     out.stroke_curve_start = in.stroke_curve_start;
     out.n_stroke_curves    = in.n_stroke_curves;
+    out.fill_rule          = in.fill_rule;
     return out;
 }
 
@@ -132,6 +136,20 @@ fn solve_vert(p1: vec2<f32>, p2: vec2<f32>, p3: vec2<f32>) -> vec2<f32> {
 fn calc_coverage(xcov: f32, ycov: f32, xwgt: f32, ywgt: f32) -> f32 {
     let blended = abs(xcov*xwgt + ycov*ywgt) / max(xwgt + ywgt, 1.0/65536.0);
     return clamp(max(blended, min(abs(xcov), abs(ycov))), 0.0, 1.0);
+}
+
+// Even-odd fill coverage: triangle wave — inside when winding count is odd.
+// The raw winding accumulator (xcov or ycov) is a signed integer at stable
+// interiors.  A triangle wave with period 2 maps even integers → 0 (outside)
+// and odd integers → 1 (inside), with half-pixel AA transitions.
+fn calc_coverage_evenodd(xcov: f32, ycov: f32, xwgt: f32, ywgt: f32) -> f32 {
+    let w     = (xcov*xwgt + ycov*ywgt) / max(xwgt + ywgt, 1.0/65536.0);
+    // Triangle wave: period 2, peak at odd integers.
+    let tri   = 1.0 - abs(2.0 * fract(abs(w) * 0.5) - 1.0);
+    // Fallback: take the max of both axis coverages independently.
+    let tx    = 1.0 - abs(2.0 * fract(abs(xcov) * 0.5) - 1.0);
+    let ty    = 1.0 - abs(2.0 * fract(abs(ycov) * 0.5) - 1.0);
+    return clamp(max(tri, min(tx, ty)), 0.0, 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +252,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let fill_cov = select(0.0, calc_coverage(xcov, ycov, xwgt, ywgt), in.n_fill_curves > 0u);
+    var fill_cov = 0.0;
+    if in.n_fill_curves > 0u {
+        if in.fill_rule == 1u {
+            fill_cov = calc_coverage_evenodd(xcov, ycov, xwgt, ywgt);
+        } else {
+            fill_cov = calc_coverage(xcov, ycov, xwgt, ywgt);
+        }
+    }
 
     // ── Stroke: SDF minimum distance in physical pixel space ──────────────
     // stroke_half_ndc is in NDC units; pixels_per_ndc.x converts to pixels.

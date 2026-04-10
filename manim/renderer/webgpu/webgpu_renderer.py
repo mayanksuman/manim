@@ -597,9 +597,16 @@ class WebGPURenderer:
         # textured quads before the VMobject pass (painter's algorithm).
         self._image_pipeline: wgpu_t.GPURenderPipeline | None = None
         self._image_tex_bgl: wgpu_t.GPUBindGroupLayout | None = None
+        self._image_tint_bgl: wgpu_t.GPUBindGroupLayout | None = None
         # Cache: ImageMobject → (fingerprint, GPUTexture, GPUBindGroup).
         # Keyed weakly so destroyed mobs release their GPU textures.
         self._image_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        # Cache: ImageMobject → (points_fingerprint, GPUBuffer).
+        # VBO is reused across frames as long as mob.points[:4] hasn't changed.
+        self._image_vbo_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        # Cache: ImageMobject → (tint_fingerprint, GPUBuffer, GPUBindGroup).
+        # Tint bind group is rebuilt only when mob.color changes.
+        self._image_tint_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
         # Compact readback compute pipeline (GPU row-depadding + B↔R fix).
         self._readback_compute_pipeline: wgpu_t.GPUComputePipeline | None = None
@@ -726,7 +733,7 @@ class WebGPURenderer:
 
         self._create_oit_resources(width, height)
         self._create_readback_pipeline(width, height)
-        self._image_tex_bgl, self._image_pipeline = self._create_image_pipeline()
+        self._image_tex_bgl, self._image_tint_bgl, self._image_pipeline = self._create_image_pipeline()
         self._true_dot_pipeline = self._create_true_dot_pipeline(self._proj_bgl)
 
         # Sub-camera pipelines (rgba8unorm target) for ZoomedScene support.
@@ -1041,13 +1048,14 @@ class WebGPURenderer:
 
     def _create_image_pipeline(
         self,
-    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
+    ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
         """Create the render pipeline for ImageMobject textured quads.
 
         Layout
         ------
         group 0 — camera uniform (reuses ``_proj_bgl``, same as VMobject shaders)
         group 1 — texture_2d<f32> at binding 0, sampler at binding 1
+        group 2 — tint uniform: vec3<f32> rgb colour multiplier (16-byte block)
 
         Vertex buffer (stride 20 B):
           location 0 — in_pos  float32x3  (12 B)
@@ -1081,8 +1089,19 @@ class WebGPURenderer:
             ]
         )
 
+        # Group 2: tint colour uniform (16 bytes: rgb vec3 + 4-byte pad)
+        tint_bgl = self._device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform", "min_binding_size": 16},
+                },
+            ]
+        )
+
         layout = self._device.create_pipeline_layout(
-            bind_group_layouts=[self._proj_bgl, tex_bgl]
+            bind_group_layouts=[self._proj_bgl, tex_bgl, tint_bgl]
         )
 
         blend = {
@@ -1139,7 +1158,7 @@ class WebGPURenderer:
             multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
         )
 
-        return tex_bgl, pipeline
+        return tex_bgl, tint_bgl, pipeline
 
     def _image_fingerprint(self, pixel_array: np.ndarray) -> int:
         """Cheap dirty-check fingerprint for a pixel array.
@@ -1223,8 +1242,11 @@ class WebGPURenderer:
         self._image_cache[mob] = (fp, tex, bg)
         return tex, bg
 
-    def _build_image_vbo(self, mob: Any) -> wgpu_t.GPUBuffer | None:
-        """Build a 6-vertex (20 B/vertex) VBO for *mob*'s bounding quad.
+    def _get_image_vbo(self, mob: Any) -> wgpu_t.GPUBuffer | None:
+        """Return a cached 6-vertex (20 B/vertex) VBO for *mob*'s bounding quad.
+
+        The VBO is rebuilt only when mob.points[:4] changes; otherwise the
+        same GPUBuffer is reused across frames without any CPU/GPU allocation.
 
         Corner layout from AbstractImageMobject.reset_points():
           points[0] = UP + LEFT   → UV (0, 0)
@@ -1233,6 +1255,12 @@ class WebGPURenderer:
           points[3] = DOWN + RIGHT→ UV (1, 1)
 
         Two CCW triangles: [0,1,2] and [1,3,2].
+
+        ``scale_to_resolution`` semantics are enforced at the Mobject level:
+        ``AbstractImageMobject.reset_points()`` converts pixel dimensions to
+        world-space units using ``scale_to_resolution`` during ``__init__``.
+        The renderer reads the resulting world-space corner positions directly
+        from ``mob.points`` — no additional scaling is applied here.
         """
         assert self._device is not None
 
@@ -1240,11 +1268,17 @@ class WebGPURenderer:
         if pts is None or len(pts) < 4:
             return None
 
-        corners = pts[:4].astype(np.float32)  # (4, 3)
+        # Fingerprint the 4 corner points exactly (48 bytes — cheap).
+        corners = pts[:4].astype(np.float32)
+        fp = hash(corners.tobytes())
+
+        cached = self._image_vbo_cache.get(mob)
+        if cached is not None and cached[0] == fp:
+            return cached[1]
+
         uvs = np.array(
             [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32
         )
-        # Index order: 0,1,2, 1,3,2
         idx = [0, 1, 2, 1, 3, 2]
         data = np.empty((6, 5), dtype=np.float32)
         data[:, :3] = corners[idx]
@@ -1254,33 +1288,43 @@ class WebGPURenderer:
             data=data.tobytes(),
             usage=wgpu.BufferUsage.VERTEX,
         )
-        self.frame_vbos.append(buf)
+        # Store persistently — NOT in frame_vbos; WeakKeyDictionary releases
+        # the buffer when the mob is garbage-collected.
+        self._image_vbo_cache[mob] = (fp, buf)
         return buf
 
-    def _draw_images_in_pass(
-        self,
-        render_pass: Any,
-        image_mobs: list,
-        camera_bind_group: Any,
-    ) -> None:
-        """Draw all *image_mobs* into *render_pass* using the image pipeline."""
-        if not image_mobs or self._image_pipeline is None:
-            return
+    def _get_image_tint_bind_group(self, mob: Any) -> wgpu_t.GPUBindGroup | None:
+        """Return a cached GPUBindGroup for *mob*'s tint colour uniform.
 
-        render_pass.set_pipeline(self._image_pipeline)
-        render_pass.set_bind_group(0, camera_bind_group, [], 0, 0)
+        The bind group is rebuilt only when ``mob.color`` changes.  The
+        default WHITE tint ``(1, 1, 1)`` is identity — texture is unchanged.
+        """
+        assert self._device is not None
+        assert self._image_tint_bgl is not None
 
-        for mob in image_mobs:
-            resources = self._get_image_gpu_resources(mob)
-            if resources is None:
-                continue
-            _, tex_bg = resources
-            vbo = self._build_image_vbo(mob)
-            if vbo is None:
-                continue
-            render_pass.set_bind_group(1, tex_bg, [], 0, 0)
-            render_pass.set_vertex_buffer(0, vbo)
-            render_pass.draw(6)
+        # Read mob.color → (r, g, b) in [0, 1].  Fall back to white.
+        try:
+            rgb = np.asarray(mob.color.to_rgb(), dtype=np.float32)
+        except Exception:
+            rgb = np.ones(3, dtype=np.float32)
+
+        fp = hash(rgb.tobytes())
+        cached = self._image_tint_cache.get(mob)
+        if cached is not None and cached[0] == fp:
+            return cached[2]
+
+        # 16-byte block: rgb (12 B) + 4-byte pad.
+        data = np.array([rgb[0], rgb[1], rgb[2], 0.0], dtype=np.float32)
+        buf = self._device.create_buffer_with_data(
+            data=data.tobytes(),
+            usage=wgpu.BufferUsage.UNIFORM,
+        )
+        bg = self._device.create_bind_group(
+            layout=self._image_tint_bgl,
+            entries=[{"binding": 0, "resource": {"buffer": buf, "offset": 0, "size": 16}}],
+        )
+        self._image_tint_cache[mob] = (fp, buf, bg)
+        return bg
 
     def _create_oit_resources(self, width: int, height: int) -> None:
         """Create OIT accumulation textures, pipelines, and bind groups."""
@@ -1490,11 +1534,14 @@ class WebGPURenderer:
         """Return (and lazily create) per-mob GPU resources for sub-camera rendering.
 
         Returns a dict with keys:
-          render_tex, render_view  — rgba8unorm render target (RENDER_ATTACHMENT | TEXTURE_BINDING)
+          render_tex, render_view  — rgba8unorm render target
+                                     (RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC)
           depth_tex,  depth_view   — depth24plus depth buffer
           uniform_buf              — 656-byte camera uniform buffer (COPY_DST | UNIFORM)
           cam_bg                   — camera-only bind group (proj_bgl, binding 0 = uniform_buf)
           tex_bg                   — image display bind group (image_tex_bgl, binding 0 = render_view)
+          staging_buf              — row-aligned COPY_DST | MAP_READ buffer for CPU readback
+          staging_aligned_bpr      — aligned bytes-per-row used by the staging buffer
         """
         assert self._device is not None
         assert self._proj_bgl is not None
@@ -1507,10 +1554,17 @@ class WebGPURenderer:
         w, h = config.pixel_width, config.pixel_height
         _UBO_SIZE = 656
 
+        # bytes_per_row must be a multiple of 256 for copy_texture_to_buffer.
+        aligned_bpr = ((w * 4) + 255) & ~255
+
         render_tex = self._device.create_texture(
             size=(w, h, 1),
             format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING,
+            usage=(
+                wgpu.TextureUsage.RENDER_ATTACHMENT
+                | wgpu.TextureUsage.TEXTURE_BINDING
+                | wgpu.TextureUsage.COPY_SRC
+            ),
         )
         render_view = render_tex.create_view()
 
@@ -1544,14 +1598,23 @@ class WebGPURenderer:
             ],
         )
 
+        # Staging buffer for CPU readback of the rendered sub-camera texture.
+        # rgba8unorm — no B↔R swap needed (unlike the main bgra8unorm target).
+        staging_buf = self._device.create_buffer(
+            size=aligned_bpr * h,
+            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+        )
+
         resources = {
-            "render_tex":  render_tex,
-            "render_view": render_view,
-            "depth_tex":   depth_tex,
-            "depth_view":  depth_view,
-            "uniform_buf": uniform_buf,
-            "cam_bg":      cam_bg,
-            "tex_bg":      tex_bg,
+            "render_tex":          render_tex,
+            "render_view":         render_view,
+            "depth_tex":           depth_tex,
+            "depth_view":          depth_view,
+            "uniform_buf":         uniform_buf,
+            "cam_bg":              cam_bg,
+            "tex_bg":              tex_bg,
+            "staging_buf":         staging_buf,
+            "staging_aligned_bpr": aligned_bpr,
         }
         self._sub_cam_resources[mob_id] = resources
         return resources
@@ -1898,16 +1961,17 @@ class WebGPURenderer:
         for item in render_queue:
             if item[0] == "image":
                 mob = item[1]
-                vbo = self._build_image_vbo(mob)
+                vbo = self._get_image_vbo(mob)
+                tint_bg = self._get_image_tint_bind_group(mob)
                 if isinstance(mob, ImageMobjectFromCamera):
                     res = self._sub_cam_resources.get(id(mob))
                     tex_bg = res["tex_bg"] if res is not None else None
-                    if vbo is not None and tex_bg is not None:
-                        resolved_queue.append(("image", vbo, tex_bg))
+                    if vbo is not None and tex_bg is not None and tint_bg is not None:
+                        resolved_queue.append(("image", vbo, tex_bg, tint_bg))
                 else:
                     resources = self._get_image_gpu_resources(mob)
-                    if vbo is not None and resources is not None:
-                        resolved_queue.append(("image", vbo, resources[1]))
+                    if vbo is not None and resources is not None and tint_bg is not None:
+                        resolved_queue.append(("image", vbo, resources[1], tint_bg))
             elif item[0] == "truedot":
                 mob = item[1]
                 arr = build_true_dot_vbo(mob)
@@ -2001,6 +2065,27 @@ class WebGPURenderer:
                 self._get_sub_cam_resources(sub_mob)  # ensure resources created
                 self._render_sub_camera_pass(sub_mob, encoder, normal_fds)
 
+            # Encode texture → staging-buffer copies so that after submit the
+            # rendered sub-camera pixels are available for CPU readback.
+            # This allows ImageMobjectFromCamera.get_pixel_array() to return
+            # current frame data instead of the stale initial pixel_array.
+            w, h = config.pixel_width, config.pixel_height
+            for sub_mob in self.camera.image_mobjects_from_cameras:
+                res = self._sub_cam_resources.get(id(sub_mob))
+                if res is None:
+                    continue
+                aligned_bpr = res["staging_aligned_bpr"]
+                encoder.copy_texture_to_buffer(
+                    {"texture": res["render_tex"], "mip_level": 0, "origin": (0, 0, 0)},
+                    {
+                        "buffer":         res["staging_buf"],
+                        "offset":         0,
+                        "bytes_per_row":  aligned_bpr,
+                        "rows_per_image": h,
+                    },
+                    (w, h, 1),
+                )
+
         # ── Pass 1: main render ───────────────────────────────────────────
         # Draw the z-ordered render queue (VMobject batches and images
         # interleaved in scene.mobjects order) so painter's-algorithm depth
@@ -2024,22 +2109,29 @@ class WebGPURenderer:
         )
         self.current_render_pass = main_pass
 
+        current_pipeline = None
         for item in resolved_queue:
             if item[0] == "image":
-                _, vbo, tex_bg = item
-                main_pass.set_pipeline(self._image_pipeline)
-                main_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
+                _, vbo, tex_bg, tint_bg = item
+                if current_pipeline != "image":
+                    main_pass.set_pipeline(self._image_pipeline)
+                    main_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
+                    current_pipeline = "image"
                 main_pass.set_bind_group(1, tex_bg, [], 0, 0)
+                main_pass.set_bind_group(2, tint_bg, [], 0, 0)
                 main_pass.set_vertex_buffer(0, vbo)
                 main_pass.draw(6)
             elif item[0] == "truedot":
                 _, buf, n_verts = item
-                main_pass.set_pipeline(self._true_dot_pipeline)
-                main_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
+                if current_pipeline != "truedot":
+                    main_pass.set_pipeline(self._true_dot_pipeline)
+                    main_pass.set_bind_group(0, self.camera_bind_group, [], 0, 0)
+                    current_pipeline = "truedot"
                 main_pass.set_vertex_buffer(0, buf)
                 main_pass.draw(n_verts)
             elif item[0] == "vmobs":
                 _, fd, cam_bg = item
+                current_pipeline = "vmobs"  # draw_frame_data sets its own pipelines
                 draw_frame_data(self, fd, cam_bg)
 
         main_pass.end()
@@ -2118,6 +2210,38 @@ class WebGPURenderer:
             fixed_pass.end()
 
         self._device.queue.submit([encoder.finish()])
+
+        # ── Sub-camera CPU readback ───────────────────────────────────────
+        # Populate mob.camera.pixel_array from the staged sub-camera texture
+        # data so that ImageMobjectFromCamera.get_pixel_array() returns the
+        # current frame rather than the stale initial array.
+        # rgba8unorm needs no B↔R channel swap (unlike the main bgra8unorm target).
+        if self.camera.image_mobjects_from_cameras:
+            w, h = config.pixel_width, config.pixel_height
+            for sub_mob in self.camera.image_mobjects_from_cameras:
+                res = self._sub_cam_resources.get(id(sub_mob))
+                if res is None:
+                    continue
+                staging_buf = res["staging_buf"]
+                aligned_bpr = res["staging_aligned_bpr"]
+                staging_buf.map_sync(wgpu.MapMode.READ)
+                raw = bytes(staging_buf.read_mapped())
+                staging_buf.unmap()
+                if aligned_bpr == w * 4:
+                    arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4).copy()
+                else:
+                    # Strip row padding before reshaping.
+                    rows = [
+                        raw[r * aligned_bpr : r * aligned_bpr + w * 4]
+                        for r in range(h)
+                    ]
+                    arr = np.frombuffer(b"".join(rows), dtype=np.uint8).reshape(h, w, 4).copy()
+                # Write into the Cairo sub-camera's pixel_array so that
+                # ImageMobjectFromCamera.get_pixel_array() returns current data.
+                try:
+                    sub_mob.camera.pixel_array = arr
+                except Exception:
+                    pass
 
         self.current_render_pass = None
         # camera_bind_group is now persistent (created once in init_scene) —

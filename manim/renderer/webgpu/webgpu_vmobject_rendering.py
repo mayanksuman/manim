@@ -564,6 +564,16 @@ def collect_frame_data(
                 except Exception:
                     pass  # fall back to solid fill_color[0]
 
+            # Gradient stroke: same pattern as fill gradient.
+            stroke_gradient_start = stroke_gradient_end = None
+            if stroke_rgba.shape[0] > 1:
+                try:
+                    stroke_gradient_start, stroke_gradient_end = (
+                        submob.get_gradient_start_and_end_points()
+                    )
+                except Exception:
+                    pass  # fall back to solid stroke_color[0]
+
             # Build bounding quad with placeholder curve indices.
             quad_verts = _build_fill_stroke_quad(
                 fill_cubics=fill_cubics,
@@ -579,6 +589,9 @@ def collect_frame_data(
                 fill_rgbas=fill_rgba if fill_rgba.shape[0] > 1 else None,
                 gradient_start=gradient_start,
                 gradient_end=gradient_end,
+                stroke_rgbas=stroke_rgba if stroke_rgba.shape[0] > 1 else None,
+                stroke_gradient_start=stroke_gradient_start,
+                stroke_gradient_end=stroke_gradient_end,
             )
             if len(quad_verts) == 0:
                 continue
@@ -1086,6 +1099,9 @@ def _build_fill_stroke_quad(
     fill_rgbas: np.ndarray | None = None,
     gradient_start: np.ndarray | None = None,
     gradient_end: np.ndarray | None = None,
+    stroke_rgbas: np.ndarray | None = None,
+    stroke_gradient_start: np.ndarray | None = None,
+    stroke_gradient_end: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build a ``_FILL_STROKE_DTYPE`` bounding quad (6 vertices) for one object.
 
@@ -1099,7 +1115,9 @@ def _build_fill_stroke_quad(
     consistent across perspective depths.
 
     *fill_rgbas* — if provided and has more than one row, enables gradient fill.
-    *gradient_start* / *gradient_end* — world-space endpoints of the gradient axis.
+    *gradient_start* / *gradient_end* — world-space endpoints of the fill gradient axis.
+    *stroke_rgbas* — if provided and has more than one row, enables gradient stroke.
+    *stroke_gradient_start* / *stroke_gradient_end* — world-space endpoints of the stroke gradient axis.
     """
     # Gather all anchor points (b0 and b3 of every cubic).
     anchor_lists: list[np.ndarray] = []
@@ -1199,13 +1217,43 @@ def _build_fill_stroke_quad(
     else:
         per_vertex_fill = np.broadcast_to(fill_color, (6, 4)).copy()
 
+    # ── Per-vertex stroke colours (gradient support) ─────────────────────────
+    if (
+        stroke_rgbas is not None
+        and stroke_rgbas.shape[0] > 1
+        and stroke_gradient_start is not None
+        and stroke_gradient_end is not None
+    ):
+        sgs = np.asarray(stroke_gradient_start, dtype=np.float32)
+        sge = np.asarray(stroke_gradient_end,   dtype=np.float32)
+        s_axis = sge - sgs
+        s_axis_len2 = float(np.dot(s_axis, s_axis))
+        if s_axis_len2 > 1e-12:
+            t_corners = np.clip(
+                np.dot(corners_w - sgs, s_axis) / s_axis_len2, 0.0, 1.0
+            )  # (4,)
+            n_stops = stroke_rgbas.shape[0]
+            idx_f  = t_corners * (n_stops - 1)
+            idx_lo = np.floor(idx_f).astype(int).clip(0, n_stops - 2)
+            idx_hi = idx_lo + 1
+            frac   = (idx_f - idx_lo)[:, None]
+            corner_colors = (
+                stroke_rgbas[idx_lo].astype(np.float32) * (1.0 - frac)
+                + stroke_rgbas[idx_hi].astype(np.float32) * frac
+            )  # (4, 4)
+            per_vertex_stroke = corner_colors[[0, 1, 2, 1, 3, 2]]  # (6, 4)
+        else:
+            per_vertex_stroke = np.broadcast_to(stroke_color, (6, 4)).copy()
+    else:
+        per_vertex_stroke = np.broadcast_to(stroke_color, (6, 4)).copy()
+
     n_fill_quads   = len(fill_cubics)   * 4  # 4 quadratics per cubic
     n_stroke_quads = len(stroke_cubics) * 4
 
     verts = np.empty(6, dtype=_FILL_STROKE_DTYPE)
     verts["in_pos"]             = quad_pos
     verts["in_fill_color"]      = per_vertex_fill
-    verts["in_stroke_color"]    = stroke_color
+    verts["in_stroke_color"]    = per_vertex_stroke
     verts["stroke_half_ndc"]    = stroke_half_ndc
     verts["fill_curve_start"]   = fill_curve_start
     verts["n_fill_curves"]      = n_fill_quads

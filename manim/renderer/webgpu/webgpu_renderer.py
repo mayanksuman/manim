@@ -785,6 +785,17 @@ class WebGPURenderer:
     def init_scene(self, scene: Scene) -> None:
         """Create the wgpu device, offscreen texture, and file writer."""
         self.scene = scene
+
+        if self._device is not None:
+            # Rerun path — reuse the existing GPU device, textures, and window.
+            # Only reset the per-scene state so the renderer is ready for a
+            # fresh construct() call without tearing down and recreating GPU
+            # resources (which would lose the live preview window).
+            self.partial_movie_files = []
+            self.file_writer = self._file_writer_class(self, scene.__class__.__name__)
+            self.background_color = config["background_color"]
+            return
+
         self.partial_movie_files: list[str | None] = []
         self.file_writer: SceneFileWriter = self._file_writer_class(
             self,

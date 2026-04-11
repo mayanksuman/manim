@@ -1443,7 +1443,9 @@ class Scene:
             )
             currentframe: FrameType = inspect.currentframe()  # type: ignore[assignment]
             local_namespace = currentframe.f_back.f_locals  # type: ignore[union-attr]
-            _webgpu_embed(self, self.renderer, local_namespace)
+            rerun = _webgpu_embed(self, self.renderer, local_namespace)
+            if rerun:
+                raise RerunSceneException
             return
 
         assert isinstance(self.camera, OpenGLCamera)

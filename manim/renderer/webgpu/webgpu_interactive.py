@@ -13,9 +13,19 @@ Thread model
   method calls are not executed here; they are posted to ``scene.queue`` and
   picked up by the main thread.
 
-After every IPython cell ``post_run_cell`` triggers a re-render so the window
-immediately reflects any changes (``add``, ``remove``, property mutations …)
-that did not go through ``play`` / ``wait``.
+After every IPython cell ``post_run_cell`` schedules a re-render sentinel on
+``scene.queue`` so the window immediately reflects any changes (``add``,
+``remove``, property mutations …) that did not go through ``play`` / ``wait``.
+
+File watching
+-------------
+A ``watchdog.Observer`` watches the scene's source file.  When the file is
+saved on disk the observer posts ``SceneInteractRerun("file")`` to
+``scene.queue``.  The main loop then tears down the IPython session and raises
+:class:`~manim.utils.exceptions.RerunSceneException`, which propagates through
+``construct()`` back to the render command's rerun loop.
+
+``rerun()`` in the IPython shell triggers the same mechanism manually.
 """
 
 from __future__ import annotations
@@ -38,7 +48,7 @@ def interactive_embed(
     scene: Scene,
     renderer: WebGPURenderer,
     local_namespace: dict[str, Any],
-) -> None:
+) -> bool:
     """Run an interactive IPython session alongside the WebGPU preview window.
 
     Parameters
@@ -53,13 +63,22 @@ def interactive_embed(
         function is called.  Scene shortcuts (``play``, ``wait``, ``add``,
         ``remove``) and the full ``manim`` namespace are injected here so
         the user can type commands without a ``self.`` prefix.
+
+    Returns
+    -------
+    bool
+        ``True`` if the session ended because ``rerun()`` was called or the
+        source file changed on disk — the caller should raise
+        :class:`~manim.utils.exceptions.RerunSceneException` in that case.
+        ``False`` for a normal exit (shell closed / window closed).
     """
     import threading
 
     import manim
-    from manim import logger
+    from manim import config, logger
     from manim.data_structures import MethodWithArgs
-    from manim.scene.scene import SceneInteractContinue
+    from manim.scene.scene import SceneInteractContinue, SceneInteractRerun
+    from manim.utils.exceptions import RerunSceneException
 
     window = renderer.window
 
@@ -75,7 +94,25 @@ def interactive_embed(
             "IPython is required for the interactive WebGPU embed.\n"
             "Install it with:  pip install ipython",
         )
-        return
+        return False
+
+    # ── File watcher ─────────────────────────────────────────────────────
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+
+        class _FileHandler(FileSystemEventHandler):
+            def on_modified(self, event: Any) -> None:
+                scene.queue.put(SceneInteractRerun("file"))
+
+        file_observer = Observer()
+        file_observer.schedule(
+            _FileHandler(), config["input_file"], recursive=True
+        )
+        file_observer.start()
+    except Exception:
+        logger.debug("watchdog not available — file-watching disabled.")
+        file_observer = None
 
     # ── Build shell ──────────────────────────────────────────────────────
     ipcfg = IPConfig()
@@ -112,6 +149,14 @@ def interactive_embed(
     for _name in ("play", "wait", "add", "remove"):
         local_namespace[_name] = _make_proxy(_name)
 
+    # rerun(): tear down this session and re-run the scene from scratch,
+    # picking up any edits saved to the source file.
+    def _rerun(*args: Any, **kwargs: Any) -> None:
+        scene.queue.put(SceneInteractRerun("keyboard"))
+        shell.exiter()
+
+    local_namespace["rerun"] = _rerun
+
     # ── After every cell: schedule a re-render on the main thread ────────
     # _post_cell runs in the IPython thread — GPU calls must not happen here.
     # Posting a sentinel to scene.queue ensures update_frame() is called on
@@ -126,7 +171,7 @@ def interactive_embed(
     # ── IPython thread ───────────────────────────────────────────────────
     def _keyboard_thread() -> None:
         shell(local_ns=local_namespace)
-        # Signal the main loop that the user closed the shell.
+        # Signal the main loop that the user closed the shell (not a rerun).
         scene.queue.put(SceneInteractContinue("keyboard"))
 
     keyboard_thread = threading.Thread(target=_keyboard_thread)
@@ -136,19 +181,51 @@ def interactive_embed(
         keyboard_thread.daemon = True
     keyboard_thread.start()
 
+    # ── Helpers ──────────────────────────────────────────────────────────
+    def _stop_file_observer() -> None:
+        if file_observer is not None:
+            file_observer.unschedule_all()
+            file_observer.stop()
+            file_observer.join()
+
+    def _exit_keyboard_thread() -> None:
+        if shell.pt_app:
+            try:
+                shell.pt_app.app.exit(exception=EOFError)
+            except Exception:
+                pass
+        keyboard_thread.join()
+        while not scene.queue.empty():
+            scene.queue.get()
+
     # ── Main thread: event loop ──────────────────────────────────────────
     scene.quit_interaction = False
     keyboard_thread_needs_join = shell.pt_app is not None
     sleep_s = 1.0 / _POLL_HZ
+    rerun_requested = False
 
     while not (window.is_closing or scene.quit_interaction):
         if not scene.queue.empty():
             action = scene.queue.get_nowait()
 
-            if isinstance(action, SceneInteractContinue):
+            if isinstance(action, SceneInteractRerun):
+                rerun_requested = True
+                _stop_file_observer()
+                if action.sender == "keyboard":
+                    # rerun() was called from the shell — thread already
+                    # exiting via shell.exiter(); just join it.
+                    keyboard_thread.join()
+                else:
+                    # File changed — kill the prompt and join.
+                    _exit_keyboard_thread()
+                # Drain stale queue items and signal rerun to the caller.
+                while not scene.queue.empty():
+                    scene.queue.get()
+                break
+
+            elif isinstance(action, SceneInteractContinue):
                 # IPython shell exited normally (user typed exit / Ctrl-D).
                 keyboard_thread.join()
-                # Drain any stale items left in the queue.
                 while not scene.queue.empty():
                     scene.queue.get()
                 keyboard_thread_needs_join = False
@@ -175,16 +252,12 @@ def interactive_embed(
             time.sleep(sleep_s)
 
     # ── Teardown ─────────────────────────────────────────────────────────
-    if keyboard_thread_needs_join and shell.pt_app:
-        # Window closed while IPython was still running — force the prompt
-        # to exit so the keyboard thread can be joined cleanly.
-        try:
-            shell.pt_app.app.exit(exception=EOFError)
-        except Exception:
-            pass
-        keyboard_thread.join()
-        while not scene.queue.empty():
-            scene.queue.get()
+    _stop_file_observer()
+
+    if keyboard_thread_needs_join:
+        _exit_keyboard_thread()
 
     if window.is_closing:
         window.destroy()
+
+    return rerun_requested

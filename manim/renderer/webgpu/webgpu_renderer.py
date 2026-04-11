@@ -508,7 +508,32 @@ class WebGPURenderer:
         self,
         file_writer_class: type[SceneFileWriter] = SceneFileWriter,
         skip_animations: bool = False,
+        msaa_samples: int = 1,
     ) -> None:
+        """Create a WebGPU renderer.
+
+        Parameters
+        ----------
+        file_writer_class:
+            Class used to write frames to disk.
+        skip_animations:
+            When True the renderer skips all animations (used for caching).
+        msaa_samples:
+            Multisample Anti-Aliasing sample count.  Must be 1 (disabled) or 4.
+            MSAA smooths geometric edges of surfaces, images, and dot-clouds.
+            VMobjects already use SDF/coverage-based AA, so the visual gain for
+            pure-2D scenes is modest; the benefit is most visible for 3-D
+            scenes with surface meshes and ``DotCloud3D``.
+
+            When MSAA is enabled the static-frame optimisation is bypassed
+            (every frame is fully re-rendered), which increases per-frame GPU
+            work.  This is acceptable because MSAA already implies a quality-
+            over-speed trade-off.
+        """
+        if msaa_samples not in (1, 4):
+            msg = f"msaa_samples must be 1 or 4, got {msaa_samples}"
+            raise ValueError(msg)
+        self._msaa_samples = msaa_samples
         self._file_writer_class = file_writer_class
         self._original_skipping_status = skip_animations
         self.skip_animations = skip_animations
@@ -554,12 +579,30 @@ class WebGPURenderer:
         self._depth_texture_view: wgpu_t.GPUTextureView | None = None
         self._proj_bgl: wgpu_t.GPUBindGroupLayout | None = None
 
+        # MSAA textures — created only when msaa_samples > 1.
+        # _msaa_texture:       bgra8unorm, sample_count=N, RENDER_ATTACHMENT only.
+        #                      Used as the draw target in Pass 1; resolves to
+        #                      _render_texture at the end of each pass.
+        # _msaa_depth_texture: depth24plus, sample_count=N, RENDER_ATTACHMENT only.
+        #                      Must match the sample count of all MSAA pipelines.
+        self._msaa_texture: wgpu_t.GPUTexture | None = None
+        self._msaa_texture_view: wgpu_t.GPUTextureView | None = None
+        self._msaa_depth_texture: wgpu_t.GPUTexture | None = None
+        self._msaa_depth_texture_view: wgpu_t.GPUTextureView | None = None
+
         # Combined fill+stroke pipelines (vmobject_fill_stroke.wgsl).
         # _fill_stroke_bgl is reused for both compute output and render input
         # (camera uniform + read-only quads storage).
         self._fill_stroke_bgl: wgpu_t.GPUBindGroupLayout | None = None
+        # Main pipelines — multisample count matches self._msaa_samples.
+        # Used in Pass 1 (the MSAA main-render pass).
         self._fill_stroke_pipeline: wgpu_t.GPURenderPipeline | None = None     # 2-D, no depth write
         self._fill_stroke_3d_pipeline: wgpu_t.GPURenderPipeline | None = None  # 3-D, depth write
+        # Overlay pipelines — always count=1.
+        # Used in Pass 4 (fixed-in-frame overlay, renders to _render_texture_view
+        # at sample_count=1 after the MSAA resolve has already completed).
+        self._fill_stroke_pipeline_1x: wgpu_t.GPURenderPipeline | None = None
+        self._fill_stroke_3d_pipeline_1x: wgpu_t.GPURenderPipeline | None = None
 
         # Compute pipeline: cubic_to_quads.wgsl.
         self._compute_bgl: wgpu_t.GPUBindGroupLayout | None = None
@@ -710,6 +753,23 @@ class WebGPURenderer:
         )
         self._depth_texture_view = self._depth_texture.create_view()
 
+        # MSAA textures — only when msaa_samples > 1.
+        if self._msaa_samples > 1:
+            self._msaa_texture = self._device.create_texture(
+                size=(width, height, 1),
+                format=wgpu.TextureFormat.bgra8unorm,
+                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+                sample_count=self._msaa_samples,
+            )
+            self._msaa_texture_view = self._msaa_texture.create_view()
+            self._msaa_depth_texture = self._device.create_texture(
+                size=(width, height, 1),
+                format=wgpu.TextureFormat.depth24plus,
+                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+                sample_count=self._msaa_samples,
+            )
+            self._msaa_depth_texture_view = self._msaa_depth_texture.create_view()
+
         self._proj_bgl = self._create_camera_bgl()
 
         # Surface mesh lines sit exactly on the surface triangles.  A negative
@@ -719,13 +779,28 @@ class WebGPURenderer:
         # (depth24plus unit ≈ 6e-8), which is large enough to reliably beat
         # floating-point depth jitter on flat/low-slope surface regions where
         # depth_bias_slope_scale alone contributes nearly zero.
-        self._surface_pipeline = self._create_surface_pipeline(self._proj_bgl, cull_mode="none", depth_write=True)
+        self._surface_pipeline = self._create_surface_pipeline(
+            self._proj_bgl, cull_mode="none", depth_write=True,
+            msaa_samples=self._msaa_samples,
+        )
 
         # Combined fill+stroke pipeline (replaces separate slug + stroke pipelines).
         self._fill_stroke_bgl, self._fill_stroke_pipeline = \
-            self._create_fill_stroke_pipeline(depth_test=False)
+            self._create_fill_stroke_pipeline(depth_test=False, msaa_samples=self._msaa_samples)
         _, self._fill_stroke_3d_pipeline = \
-            self._create_fill_stroke_pipeline(depth_test=True)
+            self._create_fill_stroke_pipeline(depth_test=True, msaa_samples=self._msaa_samples)
+
+        # Overlay pipelines — always count=1.  Used in Pass 4 (fixed-in-frame)
+        # which renders directly into _render_texture_view after the MSAA resolve.
+        if self._msaa_samples > 1:
+            _, self._fill_stroke_pipeline_1x = \
+                self._create_fill_stroke_pipeline(depth_test=False, msaa_samples=1)
+            _, self._fill_stroke_3d_pipeline_1x = \
+                self._create_fill_stroke_pipeline(depth_test=True, msaa_samples=1)
+        else:
+            # When MSAA is off the overlay pipelines are the same objects.
+            self._fill_stroke_pipeline_1x = self._fill_stroke_pipeline
+            self._fill_stroke_3d_pipeline_1x = self._fill_stroke_3d_pipeline
 
         # GPU compute: cubic → quadratic conversion.
         self._compute_bgl, self._cubic_to_quads_pipeline = \
@@ -733,18 +808,24 @@ class WebGPURenderer:
 
         self._create_oit_resources(width, height)
         self._create_readback_pipeline(width, height)
-        self._image_tex_bgl, self._image_tint_bgl, self._image_pipeline = self._create_image_pipeline()
-        self._true_dot_pipeline = self._create_true_dot_pipeline(self._proj_bgl)
+        self._image_tex_bgl, self._image_tint_bgl, self._image_pipeline = \
+            self._create_image_pipeline(msaa_samples=self._msaa_samples)
+        self._true_dot_pipeline = self._create_true_dot_pipeline(
+            self._proj_bgl, msaa_samples=self._msaa_samples,
+        )
 
         # Sub-camera pipelines (rgba8unorm target) for ZoomedScene support.
+        # Sub-camera targets are always count=1 (they render into their own
+        # rgba8unorm textures, not into the MSAA main buffer).
         _, self._sub_cam_fill_stroke_pipeline = self._create_fill_stroke_pipeline(
-            depth_test=False, target_format="rgba8unorm"
+            depth_test=False, target_format="rgba8unorm", msaa_samples=1
         )
         _, self._sub_cam_fill_stroke_3d_pipeline = self._create_fill_stroke_pipeline(
-            depth_test=True, target_format="rgba8unorm"
+            depth_test=True, target_format="rgba8unorm", msaa_samples=1
         )
         self._sub_cam_surface_pipeline = self._create_surface_pipeline(
-            self._proj_bgl, cull_mode="none", depth_write=True, target_format="rgba8unorm"
+            self._proj_bgl, cull_mode="none", depth_write=True,
+            target_format="rgba8unorm", msaa_samples=1,
         )
 
         # Persistent camera uniform buffers — created once, updated each frame via
@@ -813,6 +894,7 @@ class WebGPURenderer:
         self,
         depth_test: bool = False,
         target_format: str = "bgra8unorm",
+        msaa_samples: int = 1,
     ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
         """Create the combined fill+stroke pipeline (vmobject_fill_stroke.wgsl).
 
@@ -879,7 +961,7 @@ class WebGPURenderer:
                 "stencil_read_mask": 0,
                 "stencil_write_mask": 0,
             },
-            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
+            multisample={"count": msaa_samples, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
         )
         return bgl, pipeline
 
@@ -933,6 +1015,7 @@ class WebGPURenderer:
         cull_mode: str = "none",
         depth_write: bool = True,
         target_format: str = "bgra8unorm",
+        msaa_samples: int = 1,
     ) -> wgpu_t.GPURenderPipeline:
         """Create a surface (mesh) pipeline.
 
@@ -988,7 +1071,7 @@ class WebGPURenderer:
                 "stencil_write_mask": 0,
             },
             multisample={
-                "count": 1,
+                "count": msaa_samples,
                 "mask": 0xFFFF_FFFF,
                 "alpha_to_coverage_enabled": False,
             },
@@ -997,6 +1080,7 @@ class WebGPURenderer:
     def _create_true_dot_pipeline(
         self,
         proj_bgl: wgpu_t.GPUBindGroupLayout,
+        msaa_samples: int = 1,
     ) -> wgpu_t.GPURenderPipeline:
         """Create the TrueDot pipeline (true_dot.wgsl).
 
@@ -1043,11 +1127,12 @@ class WebGPURenderer:
                 "stencil_read_mask": 0,
                 "stencil_write_mask": 0,
             },
-            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
+            multisample={"count": msaa_samples, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
         )
 
     def _create_image_pipeline(
         self,
+        msaa_samples: int = 1,
     ) -> tuple[wgpu_t.GPUBindGroupLayout, wgpu_t.GPUBindGroupLayout, wgpu_t.GPURenderPipeline]:
         """Create the render pipeline for ImageMobject textured quads.
 
@@ -1155,7 +1240,7 @@ class WebGPURenderer:
                 "stencil_read_mask": 0,
                 "stencil_write_mask": 0,
             },
-            multisample={"count": 1, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
+            multisample={"count": msaa_samples, "mask": 0xFFFF_FFFF, "alpha_to_coverage_enabled": False},
         )
 
         return tex_bgl, tint_bgl, pipeline
@@ -1782,6 +1867,26 @@ class WebGPURenderer:
         return self._fill_stroke_3d_pipeline
 
     @property
+    def fill_stroke_pipeline_1x(self) -> wgpu_t.GPURenderPipeline:
+        """Combined fill+stroke pipeline — 2-D, always count=1.
+
+        Used for the fixed-in-frame overlay pass (Pass 4) which renders directly
+        into ``_render_texture_view`` after the MSAA resolve has completed.
+        """
+        assert self._fill_stroke_pipeline_1x is not None, "init_scene() has not been called"
+        return self._fill_stroke_pipeline_1x
+
+    @property
+    def fill_stroke_3d_pipeline_1x(self) -> wgpu_t.GPURenderPipeline:
+        """Combined fill+stroke pipeline — 3-D, always count=1.
+
+        Used for the fixed-in-frame overlay pass (Pass 4) which renders directly
+        into ``_render_texture_view`` after the MSAA resolve has completed.
+        """
+        assert self._fill_stroke_3d_pipeline_1x is not None, "init_scene() has not been called"
+        return self._fill_stroke_3d_pipeline_1x
+
+    @property
     def surface_pipeline(self) -> wgpu_t.GPURenderPipeline:
         """Opaque surface pipeline (depth_write=True)."""
         assert self._surface_pipeline is not None, "init_scene() has not been called"
@@ -2033,7 +2138,19 @@ class WebGPURenderer:
         # copy the static texture into the render texture before any render
         # passes.  The subsequent main pass uses load_op="load" so the static
         # pixels are preserved under the newly drawn moving mobs.
-        if blit_static and self._has_static_frame and self._static_texture is not None:
+        #
+        # With MSAA the static optimisation is bypassed: the MSAA texture is an
+        # intermediate buffer that always resolves into _render_texture at the
+        # end of Pass 1, overwriting whatever was there.  Every frame is fully
+        # re-rendered instead.  (MSAA already implies a quality-over-speed
+        # trade-off, so the extra work per frame is acceptable.)
+        _do_static_blit = (
+            blit_static
+            and self._has_static_frame
+            and self._static_texture is not None
+            and self._msaa_samples == 1
+        )
+        if _do_static_blit:
             encoder.copy_texture_to_texture(
                 {"texture": self._static_texture, "mip_level": 0, "origin": (0, 0, 0)},
                 {"texture": self._render_texture, "mip_level": 0, "origin": (0, 0, 0)},
@@ -2090,22 +2207,52 @@ class WebGPURenderer:
         # Draw the z-ordered render queue (VMobject batches and images
         # interleaved in scene.mobjects order) so painter's-algorithm depth
         # is respected for any combination of images and geometry.
-        color_load_op = "load" if blit_static else "clear"
-        main_pass = encoder.begin_render_pass(
-            color_attachments=[
-                {
-                    "view": self._render_texture_view,
-                    "load_op": color_load_op,
-                    "store_op": "store",
-                    "clear_value": tuple(float(c) for c in bg),
-                }
-            ],
-            depth_stencil_attachment={
+        #
+        # MSAA path (msaa_samples > 1):
+        #   color view    — _msaa_texture_view (intermediate MSAA buffer)
+        #   resolve_target — _render_texture_view (receives the resolved pixels)
+        #   store_op      — "discard" for the MSAA buffer (transient, never read back)
+        #   depth view    — _msaa_depth_texture_view (sample_count must match pipeline)
+        #   depth store   — "discard" (MSAA depth is not sampled later; OIT uses
+        #                   _depth_texture_view at count=1 separately)
+        #
+        # Non-MSAA path (msaa_samples == 1):
+        #   color view    — _render_texture_view directly
+        #   depth view    — _depth_texture_view (reused by OIT pass below)
+        if self._msaa_samples > 1:
+            assert self._msaa_texture_view is not None
+            assert self._msaa_depth_texture_view is not None
+            _color_attachment = {
+                "view": self._msaa_texture_view,
+                "resolve_target": self._render_texture_view,
+                "load_op": "clear",
+                "store_op": "discard",
+                "clear_value": tuple(float(c) for c in bg),
+            }
+            _depth_attachment = {
+                "view": self._msaa_depth_texture_view,
+                "depth_clear_value": 1.0,
+                "depth_load_op": "clear",
+                "depth_store_op": "discard",
+            }
+        else:
+            color_load_op = "load" if _do_static_blit else "clear"
+            _color_attachment = {
+                "view": self._render_texture_view,
+                "load_op": color_load_op,
+                "store_op": "store",
+                "clear_value": tuple(float(c) for c in bg),
+            }
+            _depth_attachment = {
                 "view": self._depth_texture_view,
                 "depth_clear_value": 1.0,
                 "depth_load_op": "clear",
                 "depth_store_op": "store",
-            },
+            }
+
+        main_pass = encoder.begin_render_pass(
+            color_attachments=[_color_attachment],
+            depth_stencil_attachment=_depth_attachment,
         )
         self.current_render_pass = main_pass
 
@@ -2146,6 +2293,14 @@ class WebGPURenderer:
         else:
             oit_fd = None
         if oit_fds:
+            # When MSAA is enabled the opaque depth lives in _msaa_depth_texture
+            # (sample_count=N).  _depth_texture (count=1) was not written in
+            # Pass 1, so OIT transparent surfaces cannot depth-test against
+            # opaque geometry — use "clear" to avoid reading stale data.
+            # In practice this means transparent surfaces are not clipped by
+            # opaque geometry when MSAA is on, which is acceptable for the
+            # typical use case (transparent surfaces in 3-D scenes).
+            oit_depth_load_op = "clear" if self._msaa_samples > 1 else "load"
             oit_pass = encoder.begin_render_pass(
                 color_attachments=[
                     {
@@ -2163,7 +2318,7 @@ class WebGPURenderer:
                 ],
                 depth_stencil_attachment={
                     "view": self._depth_texture_view,
-                    "depth_load_op": "load",
+                    "depth_load_op": oit_depth_load_op,
                     "depth_store_op": "discard",
                 },
             )
@@ -2193,6 +2348,17 @@ class WebGPURenderer:
         # ── Pass 4: fixed-in-frame overlay ───────────────────────────────
         # Rendered after OIT so overlays always appear on top of the 3-D scene.
         # Fresh depth buffer: overlays only depth-test against each other.
+        #
+        # This pass always renders directly into _render_texture_view at
+        # sample_count=1, regardless of the MSAA setting.  The MSAA resolve
+        # (end of Pass 1) has already completed, so _render_texture contains
+        # the full scene.  Fixed-in-frame mobjects are 2-D overlays whose SDF
+        # anti-aliasing is already excellent; MSAA adds nothing here.
+        #
+        # When MSAA is enabled the fill+stroke pipelines have multisample
+        # count=N and cannot be used in a count=1 pass.  We temporarily swap
+        # in the _1x pipeline variants so that draw_frame_data issues
+        # compatible GPU commands.
         if fixed_frame_fd is not None:
             fixed_pass = encoder.begin_render_pass(
                 color_attachments=[
@@ -2206,7 +2372,17 @@ class WebGPURenderer:
                 },
             )
             self.current_render_pass = fixed_pass
+            if self._msaa_samples > 1:
+                # Temporarily expose count=1 pipelines so draw_frame_data
+                # records compatible draw calls for this count=1 pass.
+                _saved_2d = self._fill_stroke_pipeline
+                _saved_3d = self._fill_stroke_3d_pipeline
+                self._fill_stroke_pipeline    = self._fill_stroke_pipeline_1x
+                self._fill_stroke_3d_pipeline = self._fill_stroke_3d_pipeline_1x
             draw_frame_data(self, fixed_frame_fd, self.fixed_frame_bind_group)
+            if self._msaa_samples > 1:
+                self._fill_stroke_pipeline    = _saved_2d
+                self._fill_stroke_3d_pipeline = _saved_3d
             fixed_pass.end()
 
         self._device.queue.submit([encoder.finish()])

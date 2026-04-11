@@ -93,8 +93,25 @@ class WebGPUCamera(Mobject):
     ----------
     * 2-D scenes: orthographic, z mapped to the WebGPU [0, 1] NDC
       range.
-    * 3-D scenes (Phase 3): perspective projection driven by ``focal_distance``
+    * 3-D scenes: perspective projection driven by ``focal_distance``
       and the Euler-angle view matrix.
+
+    Interactive controls (preview window only)
+    ------------------------------------------
+    When a preview window is open, :class:`WebGPUWindow` handles mouse
+    events and mutates the camera in real time:
+
+    * **Left-drag** — orbit: horizontal motion changes ``theta``; vertical
+      motion changes ``phi`` (clamped to ``[minimum_polar_angle,
+      maximum_polar_angle]``).
+    * **Right-drag / middle-drag** — pan: translates the view laterally in
+      camera space.  The pan offset is owned by the window and injected into
+      ``view_matrix`` via ``_cam_pan_x`` / ``_cam_pan_y`` just before each
+      render; it is not part of the scripted camera model.
+    * **Scroll wheel** — zoom: adjusts ``focal_distance`` for perspective
+      cameras or scales ``frame_shape`` for orthographic cameras.
+    * **Key** ``r`` — reset: restores ``euler_angles`` and ``focal_distance``
+      to their defaults and clears the window pan offset.
 
     Parameters
     ----------
@@ -359,16 +376,22 @@ class WebGPUCamera(Mobject):
 
         Uses T(-c) @ R_inv, which rotates the world around the origin (matches
         OpenGLCamera behavior where the camera orbits the focal point).
+
+        ``_cam_pan_x`` / ``_cam_pan_y`` are injected by :class:`WebGPUWindow`
+        just before each render call.  They are not initialised in ``__init__``
+        so that the camera model stays free of window/interaction state.
+        ``getattr`` defaults to 0 when no window is attached.
         """
         R = np.asarray(self.inverse_rotation_matrix, dtype=np.float32)  # 3×3
         c = self.frame_center.astype(np.float32)
         view = np.eye(4, dtype=np.float32)
         view[:3, :3] = R
-        # Translation in camera space: T(-c) followed by rotation R is equivalent
-        # to rotating the origin then translating, or translating the origin then rotating.
-        # To stay centered on origin: rotate first, then translate by -distance.
-        # V = translation(0, 0, -11) @ R_inv
-        view[:3, 3] = [0.0, 0.0, -c[2]]
+        # Camera-space translation: orbit distance along -Z plus lateral pan.
+        # Positive pan_x shifts the scene right (camera moves left), matching
+        # the "drag scene to the right" expectation for right-drag pan.
+        pan_x = float(getattr(self, "_cam_pan_x", 0.0))
+        pan_y = float(getattr(self, "_cam_pan_y", 0.0))
+        view[:3, 3] = [-pan_x, -pan_y, -c[2]]
         return view
 
     @property
@@ -502,13 +525,67 @@ class WebGPUCamera(Mobject):
 
 
 class WebGPURenderer:
-    """Headless WebGPU renderer (Phase 1: fill rendering to PNG / video)."""
+    """WebGPU renderer for Manim — headless and interactive preview.
+
+    Supports PNG / video output in headless mode and a live preview window
+    (enabled by ``config.preview = True`` or the ``-p`` CLI flag).
+
+    Preview window controls
+    -----------------------
+    When the preview window is open, the camera can be navigated interactively
+    with the mouse.  All interactions take effect immediately without restarting
+    the scene.
+
+    ========================  ================================================
+    Input                     Action
+    ========================  ================================================
+    Left-drag                 **Orbit** — horizontal drag rotates theta (yaw);
+                              vertical drag tilts phi (pitch), clamped to ±90°.
+    Right-drag / Middle-drag  **Pan** — translates the view laterally in camera
+                              space, proportional to the current frame size.
+    Scroll wheel              **Zoom** — perspective: adjusts ``focal_distance``
+                              exponentially (~12 % per notch); orthographic:
+                              scales ``frame_shape`` by the same factor.
+    Key ``r``                 **Reset** — restores the camera's default orbit,
+                              zoom, and clears any accumulated pan offset.
+    Key ``q``                 **Quit** — closes the preview window.
+    ========================  ================================================
+
+    Customising window interaction
+    ------------------------------
+    Subclass :class:`~.WebGPUWindow` and pass it via ``window_class`` to
+    override any interaction hook without modifying the renderer itself:
+
+    ========================  ================================================
+    Hook to override          Triggered by
+    ========================  ================================================
+    ``on_mouse_drag``         Pointer move while a button is held.
+    ``on_scroll``             Wheel / scroll event.
+    ``on_key_press``          Key pressed down.
+    ``on_key_release``        Key released.
+    ``on_mouse_left_click``   Left button clicked (no drag).
+    ``on_mouse_right_click``  Right button clicked (no drag).
+    ========================  ================================================
+
+    Building-block helpers ``orbit(dx, dy)``, ``pan(dx, dy)``, and
+    ``zoom(scroll_dy)`` are also overridable for finer control.  See
+    :class:`~.WebGPUWindow` for a full example.
+
+    MSAA
+    ----
+    Pass ``msaa_samples=4`` to enable 4× multisample anti-aliasing.  This
+    smooths geometric edges on surfaces, images, and dot-clouds (VMobjects
+    already use SDF/coverage-based AA so the gain for pure-2D scenes is
+    modest).  MSAA bypasses the static-frame optimisation, re-rendering every
+    frame in full.
+    """
 
     def __init__(
         self,
         file_writer_class: type[SceneFileWriter] = SceneFileWriter,
         skip_animations: bool = False,
         msaa_samples: int = 1,
+        window_class: type | None = None,
     ) -> None:
         """Create a WebGPU renderer.
 
@@ -529,11 +606,19 @@ class WebGPURenderer:
             (every frame is fully re-rendered), which increases per-frame GPU
             work.  This is acceptable because MSAA already implies a quality-
             over-speed trade-off.
+        window_class:
+            Class used to create the preview window.  Must be
+            :class:`~.WebGPUWindow` or a subclass of it.  Defaults to
+            :class:`~.WebGPUWindow`.  Pass a subclass to customise mouse/
+            keyboard interaction by overriding :meth:`~.WebGPUWindow.on_mouse_drag`,
+            :meth:`~.WebGPUWindow.on_scroll`, :meth:`~.WebGPUWindow.on_key_press`,
+            or :meth:`~.WebGPUWindow.on_key_release`.
         """
         if msaa_samples not in (1, 4):
             msg = f"msaa_samples must be 1 or 4, got {msaa_samples}"
             raise ValueError(msg)
         self._msaa_samples = msaa_samples
+        self._window_class = window_class
         self._file_writer_class = file_writer_class
         self._original_skipping_status = skip_animations
         self.skip_animations = skip_animations
@@ -862,7 +947,8 @@ class WebGPURenderer:
 
         if self.should_create_window():
             from .webgpu_renderer_window import WebGPUWindow
-            self.window = WebGPUWindow(self)
+            wclass = self._window_class or WebGPUWindow
+            self.window = wclass(self)
 
     # ------------------------------------------------------------------
     # Pipeline creation

@@ -70,6 +70,7 @@ homepage = "https://www.manim.community/"
 [project.optional-dependencies]
 gui = [
     "dearpygui>=1.0.0",
+    "rendercanvas>=2.6.3",
 ]
 jupyterlab = [
     "jupyterlab>=4.3.4",

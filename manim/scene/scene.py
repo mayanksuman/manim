@@ -210,15 +210,16 @@ class Scene:
             if renderer is None:
                 renderer = WebGPURenderer()
 
-        if renderer is None:
-            self.renderer: CairoRenderer | OpenGLRenderer = CairoRenderer(
+        elif config.renderer == RendererType.CAIRO:
+            if renderer is None:
+                renderer = CairoRenderer(
                 # TODO: Is it a suitable approach to make an instance of
                 # the self.camera_class here?
                 camera_class=self.camera_class,
                 skip_animations=self.skip_animations,
             )
-        else:
-            self.renderer = renderer
+    
+        self.renderer: CairoRenderer | OpenGLRenderer | WebGPURenderer = renderer
         self.renderer.init_scene(self)
 
         self.mobjects: list[Mobject] = []
@@ -474,8 +475,7 @@ class Scene:
             for mob in self.mobjects:
                 family_members.extend(mob.get_family())
             return family_members
-        else:
-            assert config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}
+        elif config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
             return extract_mobject_family_members(
                 self.mobjects,
                 use_z_index=self.renderer.camera.use_z_index,
@@ -509,8 +509,7 @@ class Scene:
             self.mobjects += new_mobjects  # type: ignore[arg-type]
             self.remove(*new_meshes)  # type: ignore[arg-type]
             self.meshes += new_meshes
-        else:
-            assert config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}
+        elif config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
             new_and_foreground_mobjects: list[Mobject] = [
                 *mobjects,  # type: ignore[list-item]
                 *self.foreground_mobjects,
@@ -569,8 +568,7 @@ class Scene:
                 filter(lambda_function, self.meshes),
             )
             return self
-        else:
-            assert config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}
+        elif config.renderer in {RendererType.CAIRO, RendererType.WEBGPU}:
             for list_name in "mobjects", "foreground_mobjects":
                 self.restructure_mobjects(mobjects, list_name, False)
             return self
@@ -1389,7 +1387,7 @@ class Scene:
         self.time_progression.close()
 
     def check_interactive_embed_is_valid(self) -> bool:
-        assert isinstance(self.renderer, OpenGLRenderer)
+        assert isinstance(self.renderer, OpenGLRenderer) or isinstance(self.renderer, WebGPURenderer) 
         if config["force_window"]:
             return True
         if self.skip_animation_preview:
@@ -1415,7 +1413,39 @@ class Scene:
         return True
 
     def interactive_embed(self) -> None:
-        """Like embed(), but allows for screen interaction."""
+        """Like embed(), but allows for screen interaction.
+
+        Drops into an IPython shell while the preview window stays alive and
+        responds to mouse / keyboard.  Scene methods (``play``, ``wait``,
+        ``add``, ``remove``) are available without a ``self.`` prefix inside
+        the shell.
+
+        Supported renderers: OpenGL, WebGPU (when ``-p`` / ``--preview`` is
+        active).  Call this from inside :meth:`construct` after the animations
+        you want to have already played.
+
+        Example
+        -------
+        .. code-block:: python
+
+            class MyScene(ThreeDScene):
+                def construct(self):
+                    ax = ThreeDAxes()
+                    self.add(ax)
+                    self.interactive_embed()
+        """
+        if config.renderer == RendererType.WEBGPU:
+            if not self.check_interactive_embed_is_valid():
+                return
+            self.interactive_mode = True
+            from manim.renderer.webgpu.webgpu_interactive import (
+                interactive_embed as _webgpu_embed,
+            )
+            currentframe: FrameType = inspect.currentframe()  # type: ignore[assignment]
+            local_namespace = currentframe.f_back.f_locals  # type: ignore[union-attr]
+            _webgpu_embed(self, self.renderer, local_namespace)
+            return
+
         assert isinstance(self.camera, OpenGLCamera)
         assert isinstance(self.renderer, OpenGLRenderer)
         if not self.check_interactive_embed_is_valid():

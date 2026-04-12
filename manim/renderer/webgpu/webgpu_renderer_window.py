@@ -36,11 +36,12 @@ that ``scene.on_key_press`` callbacks work unchanged.
 from __future__ import annotations
 
 import math
+import re
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from manim import __version__, config
+from manim import __version__, config, logger
 
 if TYPE_CHECKING:
     from .webgpu_renderer import WebGPURenderer
@@ -117,17 +118,176 @@ def _modifiers_to_int(modifiers: tuple | list) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Window size helper
+# Window configuration helpers
 # ---------------------------------------------------------------------------
 
 def _compute_window_size() -> tuple[int, int]:
-    """Return ``(width, height)`` for the preview window in logical pixels.
+    """Return the initial canvas size in logical pixels.
 
-    Defaults to ``(pixel_width, pixel_height)`` so that the surface texture
-    produced by the canvas always matches the offscreen render texture,
-    making ``copy_texture_to_texture`` safe without any size bookkeeping.
+    If ``config.window_size`` is ``"default"`` the canvas is made exactly
+    ``(pixel_width, pixel_height)`` so the offscreen render texture and the
+    window surface are always the same size — keeping
+    ``copy_texture_to_texture`` safe with no extra bookkeeping.
+
+    If the user specified an explicit size (e.g. ``--window_size 960,540``)
+    that size is used for the *display* window instead.  The offscreen render
+    texture still has its full ``pixel_width × pixel_height`` resolution; the
+    copy in :meth:`WebGPUWindow._draw_frame` uses the minimum of the two
+    dimensions so it never overflows either texture.
     """
+    win_size = config.window_size
+    if win_size != "default":
+        return int(win_size[0]), int(win_size[1])
     return config.pixel_width, config.pixel_height
+
+
+def _resolve_window_position(
+    pos: str,
+    monitor: object,
+    win_w: int,
+    win_h: int,
+) -> tuple[int, int]:
+    """Convert a ``config.window_position`` string to absolute ``(x, y)``.
+
+    Accepts direction strings (``"UL"``, ``"UR"``, ``"DL"``, ``"DR"``,
+    ``"ORIGIN"``, ``"LEFT"``, ``"RIGHT"``, ``"UP"``, ``"DOWN"``) or a pixel
+    coordinate pair in ``"x,y"`` / ``"x;y"`` format.
+
+    Parameters
+    ----------
+    pos:
+        The raw ``config.window_position`` string.
+    monitor:
+        A ``screeninfo.Monitor`` (or any object with ``.x``, ``.y``,
+        ``.width``, ``.height`` attributes).
+    win_w, win_h:
+        Current canvas logical width / height in pixels.
+    """
+    mx: int = monitor.x       # type: ignore[attr-defined]
+    my: int = monitor.y       # type: ignore[attr-defined]
+    mw: int = monitor.width   # type: ignore[attr-defined]
+    mh: int = monitor.height  # type: ignore[attr-defined]
+
+    # Numeric "x,y" or "x;y" coordinate pair
+    m = re.match(r"^(\d+)\s*[,;]\s*(\d+)$", pos.strip())
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    pos_u = pos.strip().upper()
+    right    = mx + mw - win_w
+    bottom   = my + mh - win_h
+    h_center = mx + (mw - win_w) // 2
+    v_center = my + (mh - win_h) // 2
+
+    return {
+        "UL":     (mx,       my),
+        "UR":     (right,    my),
+        "DL":     (mx,       bottom),
+        "DR":     (right,    bottom),
+        "ORIGIN": (h_center, v_center),
+        "LEFT":   (mx,       v_center),
+        "RIGHT":  (right,    v_center),
+        "UP":     (h_center, my),
+        "DOWN":   (h_center, bottom),
+    }.get(pos_u, (h_center, v_center))
+
+
+def _apply_window_config(canvas) -> None:
+    """Apply all window-related manim config options to a live canvas.
+
+    Handles ``window_size``, ``window_position``, ``window_monitor``, and
+    ``fullscreen``.  Errors are caught and logged as debug messages so that a
+    missing ``screeninfo`` installation or an unsupported backend never
+    prevents the window from opening.
+    """
+    # ── Window display size ──────────────────────────────────────────────
+    win_size = config.window_size
+    if win_size != "default":
+        try:
+            canvas.set_logical_size(float(win_size[0]), float(win_size[1]))
+        except Exception as exc:
+            logger.debug("WebGPU: could not set window size: %s", exc)
+
+    # ── Monitor list ─────────────────────────────────────────────────────
+    try:
+        import screeninfo
+        monitors = screeninfo.get_monitors()
+    except Exception:
+        monitors = []
+
+    mon_idx = int(config.window_monitor) if config.window_monitor is not None else 0
+    monitor = None
+    if monitors:
+        monitor = monitors[mon_idx] if mon_idx < len(monitors) else monitors[0]
+
+    # ── Backend-specific placement ───────────────────────────────────────
+    # Try GLFW backend first (canvas has a raw ``_window`` handle).
+    glfw_window = getattr(canvas, "_window", None)
+    if glfw_window is not None:
+        _apply_glfw_placement(canvas, glfw_window, monitor, mon_idx)
+        return
+
+    # Try Qt backend (canvas IS a QWidget — move() / showFullScreen() work).
+    if hasattr(canvas, "showFullScreen") and hasattr(canvas, "move"):
+        _apply_qt_placement(canvas, monitor)
+
+
+def _apply_glfw_placement(canvas, glfw_window, monitor, mon_idx: int) -> None:
+    """Apply position / fullscreen via the raw GLFW window handle."""
+    try:
+        import glfw  # pyGLFW — installed as a rendercanvas dependency
+    except ImportError:
+        logger.debug("WebGPU: glfw not importable; skipping window placement.")
+        return
+
+    if config.fullscreen:
+        glfw_monitors = glfw.get_monitors()
+        if not glfw_monitors:
+            return
+        glfw_mon = (
+            glfw_monitors[mon_idx]
+            if mon_idx < len(glfw_monitors)
+            else glfw_monitors[0]
+        )
+        mode = glfw.get_video_mode(glfw_mon)
+        glfw.set_window_monitor(
+            glfw_window, glfw_mon,
+            0, 0, mode.size.width, mode.size.height, mode.refresh_rate,
+        )
+        return
+
+    if monitor is None:
+        return
+
+    try:
+        lw, lh = canvas.get_logical_size()
+    except Exception:
+        lw, lh = config.pixel_width, config.pixel_height
+
+    x, y = _resolve_window_position(
+        str(config.window_position), monitor, int(lw), int(lh)
+    )
+    glfw.set_window_pos(glfw_window, x, y)
+
+
+def _apply_qt_placement(canvas, monitor) -> None:
+    """Apply position / fullscreen on a Qt-backed canvas (QWidget)."""
+    if config.fullscreen:
+        canvas.showFullScreen()
+        return
+
+    if monitor is None:
+        return
+
+    try:
+        lw, lh = canvas.get_logical_size()
+    except Exception:
+        lw, lh = config.pixel_width, config.pixel_height
+
+    x, y = _resolve_window_position(
+        str(config.window_position), monitor, int(lw), int(lh)
+    )
+    canvas.move(x, y)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +406,7 @@ class WebGPUWindow:
         self._context.configure(
             device=renderer._device,
             format=wgpu.TextureFormat.bgra8unorm,
-            usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_DST,
+            usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
         )
 
         # Register the draw callback (executed inside the rendercanvas lifecycle
@@ -272,6 +432,12 @@ class WebGPUWindow:
         self._pan_x: float = 0.0
         self._pan_y: float = 0.0
 
+        # Blit pipeline — scales the offscreen render texture to whatever size
+        # the window surface happens to be (supports config.window_size).
+        self._blit_pipeline, self._blit_bgl, self._blit_sampler = (
+            self._create_blit_pipeline()
+        )
+
         # Register event handlers.
         self._canvas.add_event_handler(self._on_key_down,     "key_down")
         self._canvas.add_event_handler(self._on_key_up,       "key_up")
@@ -279,6 +445,9 @@ class WebGPUWindow:
         self._canvas.add_event_handler(self._on_pointer_down, "pointer_down")
         self._canvas.add_event_handler(self._on_pointer_up,   "pointer_up")
         self._canvas.add_event_handler(self._on_wheel,        "wheel")
+
+        # Apply window configuration: size, position, monitor, fullscreen.
+        _apply_window_config(self._canvas)
 
     # ------------------------------------------------------------------
     # Public interface (consumed by WebGPURenderer and scene.py)
@@ -305,26 +474,144 @@ class WebGPUWindow:
         self._canvas.force_draw()
 
     # ------------------------------------------------------------------
+    # Blit pipeline — scales render texture → window surface
+    # ------------------------------------------------------------------
+
+    _BLIT_SHADER = """
+        struct VertOut {
+            @builtin(position) pos : vec4<f32>,
+            @location(0)       uv  : vec2<f32>,
+        };
+
+        // Full-screen quad from 4 vertices (triangle-strip).
+        // NDC y=+1 is the top of the screen; UV y=0 is the top of the texture.
+        @vertex
+        fn vs_main(@builtin(vertex_index) vi: u32) -> VertOut {
+            var pos = array<vec2<f32>, 4>(
+                vec2(-1.0,  1.0),   // top-left
+                vec2( 1.0,  1.0),   // top-right
+                vec2(-1.0, -1.0),   // bottom-left
+                vec2( 1.0, -1.0),   // bottom-right
+            );
+            var uv = array<vec2<f32>, 4>(
+                vec2(0.0, 0.0),     // top-left
+                vec2(1.0, 0.0),     // top-right
+                vec2(0.0, 1.0),     // bottom-left
+                vec2(1.0, 1.0),     // bottom-right
+            );
+            var out: VertOut;
+            out.pos = vec4(pos[vi], 0.0, 1.0);
+            out.uv  = uv[vi];
+            return out;
+        }
+
+        @group(0) @binding(0) var tex  : texture_2d<f32>;
+        @group(0) @binding(1) var samp : sampler;
+
+        @fragment
+        fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
+            return textureSample(tex, samp, in.uv);
+        }
+    """
+
+    def _create_blit_pipeline(self):
+        """Build the pipeline used to blit the render texture to the window.
+
+        Returns ``(pipeline, bind_group_layout, sampler)``.  All three are
+        reused every frame; only the per-frame bind group (which wraps the
+        current render texture view) is created anew in ``_draw_frame``.
+        """
+        device = self._renderer._device
+
+        shader = device.create_shader_module(code=self._BLIT_SHADER)
+
+        bgl = device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {
+                        "sample_type": "float",
+                        "view_dimension": "2d",
+                        "multisampled": False,
+                    },
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+            ]
+        )
+
+        pipeline = device.create_render_pipeline(
+            layout=device.create_pipeline_layout(bind_group_layouts=[bgl]),
+            vertex={"module": shader, "entry_point": "vs_main"},
+            fragment={
+                "module": shader,
+                "entry_point": "fs_main",
+                "targets": [{"format": wgpu.TextureFormat.bgra8unorm}],
+            },
+            primitive={
+                "topology": wgpu.PrimitiveTopology.triangle_strip,
+                "strip_index_format": wgpu.IndexFormat.uint32,
+            },
+        )
+
+        # Linear filtering gives a smooth downscale when the window is
+        # smaller than the render texture; nearest would produce aliasing.
+        sampler = device.create_sampler(
+            mag_filter="linear",
+            min_filter="linear",
+        )
+
+        return pipeline, bgl, sampler
+
+    # ------------------------------------------------------------------
     # Draw callback (runs inside the rendercanvas present lifecycle)
     # ------------------------------------------------------------------
 
     def _draw_frame(self) -> None:
-        """Copy the offscreen render texture to the window surface texture."""
+        """Blit the offscreen render texture to the window surface.
+
+        A full-screen-quad render pass scales the render texture to whatever
+        size the window surface currently is, so the image always fills the
+        window correctly regardless of ``config.window_size``.
+        """
         renderer = self._renderer
         if renderer._render_texture is None or renderer._device is None:
             return
 
-        surface_tex = self._context.get_current_texture()
-        w = config.pixel_width
-        h = config.pixel_height
+        device       = renderer._device
+        surface_tex  = self._context.get_current_texture()
+        surface_view = surface_tex.create_view()
 
-        encoder = renderer._device.create_command_encoder()
-        encoder.copy_texture_to_texture(
-            {"texture": renderer._render_texture, "mip_level": 0, "origin": (0, 0, 0)},
-            {"texture": surface_tex,              "mip_level": 0, "origin": (0, 0, 0)},
-            (w, h, 1),
+        render_tex_view = renderer._render_texture.create_view()
+        bind_group = device.create_bind_group(
+            layout=self._blit_bgl,
+            entries=[
+                {"binding": 0, "resource": render_tex_view},
+                {"binding": 1, "resource": self._blit_sampler},
+            ],
         )
-        renderer._device.queue.submit([encoder.finish()])
+
+        encoder = device.create_command_encoder()
+        rp = encoder.begin_render_pass(
+            color_attachments=[
+                {
+                    "view":        surface_view,
+                    "load_op":     "clear",
+                    "store_op":    "store",
+                    "clear_value": (0.0, 0.0, 0.0, 1.0),
+                }
+            ]
+        )
+        rp.set_pipeline(self._blit_pipeline)
+        rp.set_bind_group(0, bind_group)
+        rp.draw(4)   # 4 vertices → one triangle-strip quad
+        rp.end()
+
+        device.queue.submit([encoder.finish()])
 
     # ------------------------------------------------------------------
     # Interactive camera helpers

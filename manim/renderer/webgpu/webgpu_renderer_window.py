@@ -130,10 +130,7 @@ def _compute_window_size() -> tuple[int, int]:
     ``copy_texture_to_texture`` safe with no extra bookkeeping.
 
     If the user specified an explicit size (e.g. ``--window_size 960,540``)
-    that size is used for the *display* window instead.  The offscreen render
-    texture still has its full ``pixel_width × pixel_height`` resolution; the
-    copy in :meth:`WebGPUWindow._draw_frame` uses the minimum of the two
-    dimensions so it never overflows either texture.
+    that size is used for the *display* window instead.
     """
     win_size = config.window_size
     if win_size != "default":

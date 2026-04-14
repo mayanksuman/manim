@@ -319,12 +319,130 @@ class _FrameData:
 # Geometry only; colors/widths are fetched fresh every frame.
 _fill_stroke_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
+# surface_mob_cache: Surface mob →
+#   (geom_hash, color_hash, big_template, seg_starts, seg_ends,
+#    sw_arr, sa_arr, has_sw, draw_cmds)
+#
+#   geom_hash   : bytes — hash of patch geometry + material ONLY (no colors).
+#                 Unchanged when FadeIn/set_fill changes opacity.
+#   color_hash  : bytes — hash of fill_rgba, stroke_rgba, stroke_width per patch.
+#                 Changes on FadeIn/set_fill without requiring retessellation.
+#   big_template: single concatenated _SURFACE_COMBINED_DTYPE array with
+#                 already-smoothed normals; colors reflect the last stored frame;
+#                 stroke_half_px == 0.0 (recomputed per-frame on each hit).
+#   seg_starts/ends: numpy intp arrays of part boundaries in big_template.
+#   sw_arr/sa_arr/has_sw: stroke metadata, updated in-place on color misses.
+#   draw_cmds   : list[str] — "surface_opaque" or "surface_oit" per part;
+#                 updated in-place on color misses (opacity class can change).
+#
+# Cache hit states:
+#   geom HIT + color HIT  → just recompute stroke_half_px (camera rotation path)
+#   geom HIT + color MISS → patch colors in big_template + recompute stroke_half_px
+#                           (FadeIn / set_fill without geometry change; O(N_parts))
+#   geom MISS             → full retessellation + normal smoothing
+_surface_mob_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+# surface_color_memo: Surface mob →
+#   (fill_cols, stroke_cols, sw_arr, sa_arr)
+#   fill_cols   : float32 (N_active, 4) — fill RGBA per active part
+#   stroke_cols : float32 (N_active, 4) — stroke RGBA per active part
+#   sw_arr      : float32 (N_active,)   — stroke width per active part
+#   sa_arr      : float32 (N_active,)   — stroke alpha per active part
+#
+# Populated by _surface_hash_pair whenever the color hash is recomputed
+# (color-only miss or full miss path).  The color-only update path in
+# collect_frame_data reads from here instead of re-iterating all submobjects,
+# saving ~2 full O(N_submobs) passes per Surface per color-changing frame.
+_surface_color_memo: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
 
 def _points_hash(vmobject: VMobject) -> int:
     pts = vmobject.points
     if pts.size == 0:
         return 0
-    return hash(pts.tobytes())
+    # Cast to float32 before hashing so that sub-epsilon float64 noise
+    # (e.g. from FadeIn / Transform's straight_path interpolation, which
+    # produces ~1e-17 differences when start == end) does not create
+    # spurious cache misses.  Genuine geometry changes are at least
+    # float32-epsilon (~1e-7) in magnitude and are still detected.
+    return hash(pts.astype(np.float32).tobytes())
+
+
+# _surface_geom_hash_memo: Surface mob → (fast_geom_id, fast_color_id, geom_hash, color_hash)
+# fast_geom_id  — XOR of id(s.points) for all submobs.
+# fast_color_id — XOR of id(fill_rgbas) ^ id(stroke_rgbas) for all submobs.
+# Separately tracking the two fast IDs lets us skip recomputing the geometry hash
+# on a color-only change without missing a genuine geometry update.
+_surface_geom_hash_memo: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _surface_hash_pair(
+    mob: "Surface",
+    submobs: list | None = None,
+) -> "tuple[bytes, bytes]":
+    """Return ``(geom_hash, color_hash)`` for *mob*.
+
+    ``geom_hash``  covers patch point positions + material params (diffuse,
+    specular, specular_exp).  It does NOT include fill/stroke colors, so a
+    FadeIn that only changes opacity does not invalidate it.
+
+    ``color_hash`` is ``fast_color_id`` packed as 8 bytes, where
+    ``fast_color_id`` is the XOR of ``id(fill_rgbas)`` / ``id(stroke_rgbas)``
+    for all submobject patches.  It changes whenever Manim replaces any color
+    array (which happens on every FadeIn / set_fill frame).
+
+    Two-level memoisation avoids full per-submob rehashing on every frame:
+    the fast IDs (XOR of array ``id()``s) detect changes in O(N_submobs)
+    without touching array data; the slow geometry hash runs only on a
+    geometry miss (first call or actual point change).
+
+    *submobs* — optional pre-computed ``mob.family_members_with_points()``.
+    Pass this from ``collect_frame_data`` to avoid a redundant tree walk.
+    """
+    if submobs is None:
+        submobs = mob.family_members_with_points()
+
+    fast_geom_id  = 0
+    fast_color_id = 0
+    for s in submobs:
+        fast_geom_id  ^= id(s.points)
+        fast_color_id ^= id(getattr(s, "fill_rgbas",   None))
+        fast_color_id ^= id(getattr(s, "stroke_rgbas", None))
+
+    memo = _surface_geom_hash_memo.get(mob)
+    if memo is not None:
+        cached_fgi, cached_fci, cached_gh, cached_ch = memo
+        if cached_fgi == fast_geom_id and cached_fci == fast_color_id:
+            # Both geometry and colors unchanged.
+            return cached_gh, cached_ch
+        if cached_fgi == fast_geom_id:
+            # Geometry unchanged, colors changed — use fast_color_id as the
+            # color hash (no submob method calls needed here).  The actual
+            # color arrays are read lazily by collect_frame_data when it
+            # applies the per-vertex update, so we skip the second O(N_submobs)
+            # iteration entirely.
+            new_ch = struct.pack("<q", fast_color_id)
+            _surface_geom_hash_memo[mob] = (fast_geom_id, fast_color_id, cached_gh, new_ch)
+            # Invalidate stale color arrays so collect_frame_data reads fresh data.
+            _surface_color_memo.pop(mob, None)
+            return cached_gh, new_ch
+
+    # Full recompute (first call or geometry change).
+    geom_parts: list[bytes] = []
+    for submob in submobs:
+        phash       = _points_hash(submob)
+        geom_parts.append(phash.to_bytes(8, "little", signed=True))
+        geom_parts.append(struct.pack("<fff",
+            float(getattr(submob, "diffuse_strength",  0.8)),
+            float(getattr(submob, "specular_strength", 0.9)),
+            float(getattr(submob, "specular_exponent", 16.0)),
+        ))
+    gh = b"".join(geom_parts)
+    ch = struct.pack("<q", fast_color_id)
+    _surface_geom_hash_memo[mob] = (fast_geom_id, fast_color_id, gh, ch)
+    # Invalidate stale color arrays so collect_frame_data reads fresh data.
+    _surface_color_memo.pop(mob, None)
+    return gh, ch
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +540,17 @@ def collect_frame_data(
     )
 
     # ── _FrameData cache check ────────────────────────────────────────────
-    fp: bytes = b""  # populated below on cache-enabled paths
-    if cache_slot is not None and mobjects:
+    # When all mobs are Surface objects the _surface_mob_cache handles
+    # geometry caching.  Skip _fd_fingerprint (it always misses when the
+    # camera rotates) and disable _FrameData caching for this call — the
+    # surface GPU buffer must be regenerated each frame to update
+    # stroke_half_px.  Non-surface or mixed calls still use _fd_fingerprint.
+    _all_surface_call: bool = (
+        bool(mobjects)
+        and all(isinstance(m, Surface) for m in mobjects if isinstance(m, VMobject))
+    )
+    fp: bytes = b""  # populated below on non-surface-only paths
+    if cache_slot is not None and mobjects and not _all_surface_call:
         fp = _fd_fingerprint(mobjects, view_matrix, proj_matrix, center_view_matrix)
         cached = renderer._fd_cache.get(cache_slot)
         if cached is not None and cached[0] == fp:
@@ -444,6 +571,11 @@ def collect_frame_data(
 
     surface_parts: list[np.ndarray] = []
     draw_plan: list[tuple[str, int]] = []
+
+    # Tracks newly-tessellated Surface mobs (cache misses) so we can store
+    # their parts in _surface_mob_cache after _smooth_surface_normals runs.
+    # Each entry: (mob, geom_hash, parts_start_idx, parts_end_idx)
+    _new_surface_mobs: list[tuple] = []
 
     # Guard against double-processing the same submobject.  This can happen
     # when mob_list is a flat family list (e.g. moving_mobjects from
@@ -470,10 +602,141 @@ def collect_frame_data(
             surf_diffuse  = float(getattr(mob, "diffuse_strength",  0.8))
             surf_specular = float(getattr(mob, "specular_strength", 0.9))
             surf_spec_exp = float(getattr(mob, "specular_exponent", 16.0))
+
+            # ── Surface geometry cache ────────────────────────────────────
+            # The geometry (verts, normals, bary, colors, material) does NOT
+            # depend on view_matrix / proj_matrix — only stroke_half_px does.
+            # Cache the fully-tessellated + smoothed arrays per mob so that
+            # a camera-only change (ambient rotation, etc.) skips the expensive
+            # per-patch Python loop and just updates stroke_half_px.
+            geom_hash, color_hash = _surface_hash_pair(mob, submobs=surface_submobs)
+            cached_entry = _surface_mob_cache.get(mob)
+
+            if cached_entry is not None and cached_entry[0] == geom_hash:
+                # ── Geometry HIT ──────────────────────────────────────────
+                # cached_entry = (geom_hash, color_hash, big_template,
+                #                 seg_starts, seg_ends,
+                #                 sw_arr, sa_arr, has_sw, draw_cmds)
+                (_, cached_color_hash, big_template, seg_starts, seg_ends,
+                 sw_arr, sa_arr, has_sw, draw_cmds) = cached_entry
+
+                if cached_color_hash != color_hash:
+                    # ── Color-only miss (FadeIn / set_fill / set_stroke) ──
+                    # Read current colors from submobjects directly using fast
+                    # attribute access (avoids method call overhead).  Build
+                    # per-part color arrays then write them in a single
+                    # vectorized np.repeat call instead of N_parts slice writes.
+                    fill_list:   list[np.ndarray] = []
+                    stroke_list: list[np.ndarray] = []
+                    sw_list:     list[float] = []
+                    sa_list:     list[float] = []
+                    for submob in surface_submobs:
+                        if id(submob) in _seen_submobs:
+                            continue
+                        f_rgba = getattr(submob, "fill_rgbas",   None)
+                        s_rgba = getattr(submob, "stroke_rgbas", None)
+                        if f_rgba is None or f_rgba.shape[0] == 0:
+                            continue
+                        if float(f_rgba[0, 3]) <= 0.0:
+                            continue
+                        has_stroke = s_rgba is not None and s_rgba.shape[0] > 0
+                        fill_list.append(f_rgba[0].astype(np.float32))
+                        stroke_list.append(
+                            s_rgba[0].astype(np.float32) if has_stroke
+                            else np.zeros(4, dtype=np.float32)
+                        )
+                        sw_list.append(float(submob.stroke_width) if has_stroke else 0.0)
+                        sa_list.append(float(s_rgba[0, 3]) if has_stroke else 0.0)
+
+                    if len(fill_list) == len(draw_cmds):
+                        fill_cols   = np.array(fill_list,   dtype=np.float32)
+                        stroke_cols = np.array(stroke_list, dtype=np.float32)
+                        sw_arr  = np.array(sw_list,  dtype=np.float32)
+                        sa_arr  = np.array(sa_list,  dtype=np.float32)
+                        has_sw  = (sw_arr > 0.0) & (sa_arr > 0.001)
+                        draw_cmds = [
+                            "surface_opaque" if float(fill_cols[i, 3]) >= 0.99
+                            else "surface_oit"
+                            for i in range(len(draw_cmds))
+                        ]
+                        # Vectorized color write: expand per-part colors to
+                        # per-vertex with repeat counts, then assign in one op.
+                        rep_counts = (seg_ends - seg_starts).astype(np.intp)
+                        big_template["in_fill_color"]   = np.repeat(fill_cols,   rep_counts, axis=0)
+                        big_template["in_stroke_color"] = np.repeat(stroke_cols, rep_counts, axis=0)
+                        _surface_mob_cache[mob] = (
+                            geom_hash, color_hash, big_template,
+                            seg_starts, seg_ends,
+                            sw_arr, sa_arr, has_sw, draw_cmds,
+                        )
+                    else:
+                        # Part count changed — treat as full miss.
+                        cached_entry = None
+
+            if cached_entry is not None and cached_entry[0] == geom_hash:
+                # ── Full HIT: copy template and recompute stroke_half_px ──
+                big_copy  = big_template.copy()
+                vm        = view_matrix.astype(np.float32)
+                pm        = proj_matrix.astype(np.float32)
+                R, t      = vm[:3, :3], vm[:3, 3]
+                from manim import config as _cfg
+                px_half  = _cfg.pixel_width * 0.5
+                pm_00    = abs(float(pm[0, 0]))
+                pm_32    = float(pm[3, 2])
+                pm_33    = float(pm[3, 3])
+
+                # Vectorized stroke_half_px: one matrix multiply + reduceat
+                # instead of per-part Python slice+mean inside a loop.
+                z_vals     = ((R @ big_copy["in_vert"].T).T + t)[:, 2]
+                part_sizes = (seg_ends - seg_starts).astype(np.float32)
+
+                # Per-part average view-space z via reduceat sum / count.
+                z_sums = np.add.reduceat(z_vals, seg_starts)
+                avg_z  = z_sums / part_sizes              # (n_parts,)
+                clip_w = pm_32 * avg_z + pm_33            # (n_parts,)
+                clip_w = np.where(np.abs(clip_w) < 1e-8, 1.0, clip_w)
+
+                shp = np.where(
+                    has_sw,
+                    0.004 * sw_arr * pm_00 / np.abs(clip_w) * px_half,
+                    0.0,
+                ).astype(np.float32)  # (n_parts,)
+
+                # Write per-part stroke_half_px into the copy using index ranges.
+                for i in range(len(draw_cmds)):
+                    big_copy["stroke_half_px"][seg_starts[i]:seg_ends[i]] = shp[i]
+
+                # Slice views for draw_plan / surface_parts.
+                for i, cmd in enumerate(draw_cmds):
+                    draw_plan.append((cmd, len(surface_parts)))
+                    surface_parts.append(big_copy[seg_starts[i]:seg_ends[i]])
+
+                # Mark submobs as seen so they aren't re-processed as VMobjects.
+                for submob in surface_submobs:
+                    _seen_submobs.add(id(submob))
+                continue
+
+            # ── Full MISS: tessellation + smoothing (original path) ───────
+            # Collect (stroke_width, stroke_color_alpha) per part so we can
+            # recompute stroke_half_px on future cache hits.
+            new_parts_start  = len(surface_parts)
+            stroke_per_part_new: list[tuple[float, float]] = []
+
             for submob in surface_submobs:
                 if id(submob) in _seen_submobs:
                     continue
                 _seen_submobs.add(id(submob))
+                stroke_rgba_sub = submob.get_stroke_rgbas()
+                sw_sub = (
+                    float(submob.get_stroke_width())
+                    if stroke_rgba_sub.shape[0] > 0
+                    else 0.0
+                )
+                s_alpha_sub = (
+                    float(stroke_rgba_sub[0, 3])
+                    if stroke_rgba_sub.shape[0] > 0
+                    else 0.0
+                )
                 data = _collect_surface_geometry(
                     submob, view_matrix, proj_matrix,
                     diffuse_strength  = float(getattr(submob, "diffuse_strength",  surf_diffuse)),
@@ -485,6 +748,13 @@ def collect_frame_data(
                     cmd = "surface_opaque" if cls == "opaque" else "surface_oit"
                     draw_plan.append((cmd, len(surface_parts)))
                     surface_parts.append(data)
+                    stroke_per_part_new.append((sw_sub, s_alpha_sub))
+
+            # Record this mob so we can cache its smoothed parts later.
+            _new_surface_mobs.append(
+                (mob, geom_hash, color_hash, new_parts_start, len(surface_parts),
+                 stroke_per_part_new)
+            )
             continue
 
         # ── Regular VMobject (2-D or shade_in_3d) ────────────────────────
@@ -686,9 +956,60 @@ def collect_frame_data(
         )
 
     # ── Upload surface data ──────────────────────────────────────────────
+    # Apply normal smoothing only to parts from cache-miss mobs; cached
+    # parts already carry correctly smoothed normals.
     surface_buf, surface_byte_offsets = None, []
     if surface_parts:
-        _smooth_surface_normals(surface_parts)
+        if _new_surface_mobs:
+            # Smooth normals for newly-tessellated slices.
+            # _new_surface_mobs entries:
+            #   (mob, geom_hash, color_hash, start, end, stroke_per_part_new)
+            new_slices: list[np.ndarray] = []
+            for mob, geom_hash, color_hash, start, end, _ in _new_surface_mobs:
+                new_slices.extend(surface_parts[start:end])
+            _smooth_surface_normals(new_slices)
+
+            # Cache each newly-tessellated mob's smoothed parts.
+            for mob, geom_hash, color_hash, start, end, stroke_per_part_new in _new_surface_mobs:
+                parts_for_mob = surface_parts[start:end]
+                if not parts_for_mob:
+                    continue
+                # Collect draw commands for this mob's global part indices.
+                # Must filter on cmd type to exclude VMobject ("fill_stroke_*")
+                # entries: draw_plan is shared between VMobject and Surface paths,
+                # and both index from 0 (fs_parts vs surface_parts respectively),
+                # so index-range-only filtering incorrectly includes VMobject entries
+                # whose fs_parts index happens to fall inside [start, end).
+                draw_cmds_for_mob = [
+                    cmd for cmd, idx in draw_plan
+                    if start <= idx < end
+                    and cmd in ("surface_opaque", "surface_oit")
+                ]
+                # Cache as a SINGLE concatenated array so a hit can copy the
+                # whole mob's geometry in one numpy operation.  stroke_half_px
+                # is zeroed in the template; it is recomputed on every hit.
+                # Colors in big_template reflect the current frame's colors so
+                # that a color-only miss can patch them in O(N_parts).
+                big_template = np.concatenate(parts_for_mob, axis=0)
+                big_template["stroke_half_px"] = 0.0
+                # Part boundary offsets as numpy arrays (avoid Python list ops on hit).
+                sizes  = np.array([len(p) for p in parts_for_mob], dtype=np.intp)
+                starts = np.concatenate([[0], np.cumsum(sizes[:-1])]).astype(np.intp)
+                ends   = starts + sizes
+                # Precompute stroke metadata as numpy arrays for vectorised hit path.
+                sw_arr_c  = np.array([sw    for sw, _  in stroke_per_part_new],
+                                     dtype=np.float32)
+                sa_arr_c  = np.array([alpha for _, alpha in stroke_per_part_new],
+                                     dtype=np.float32)
+                has_sw_c  = (sw_arr_c > 0.0) & (sa_arr_c > 0.001)
+                _surface_mob_cache[mob] = (
+                    geom_hash, color_hash,
+                    big_template,
+                    starts, ends,
+                    sw_arr_c, sa_arr_c, has_sw_c,
+                    draw_cmds_for_mob,
+                )
+
         surface_buf, surface_byte_offsets = _batch_upload(device, surface_parts)
         renderer.frame_vbos.append(surface_buf)
 
@@ -714,7 +1035,9 @@ def collect_frame_data(
     # frame_vbos are NOT added for cached buffers — the cache itself is the owner.
     # Remove the just-uploaded buffers from frame_vbos so they aren't released at
     # end-of-frame (the cache needs them to survive across frames).
-    if cache_slot is not None:
+    # _all_surface_call paths are excluded: the surface GPU buffer changes every
+    # frame (stroke_half_px update), so the _FrameData cache cannot help there.
+    if cache_slot is not None and not _all_surface_call:
         cached_bufs = {
             id(result.fs_buf),
             id(result.cubics_buf),

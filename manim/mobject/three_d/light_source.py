@@ -82,6 +82,7 @@ class LightSource(Mobject):
         super().__init__(**kwargs)
         self.light_color: np.ndarray = np.asarray(color_to_rgb(color), dtype=np.float32)
         self.intensity: float = float(intensity)
+        self.should_render: bool = False
 
     # ------------------------------------------------------------------
     # Packing helpers (used by the renderer)
@@ -187,7 +188,7 @@ class DirectionalLight(LightSource):
         self,
         direction: Vector3D = np.array([0.0, -1.0, -1.0]),
         color: ParsableManimColor = WHITE,
-        intensity: float = 0.8,
+        intensity: float = 1.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(color=color, intensity=intensity, **kwargs)

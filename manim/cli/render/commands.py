@@ -120,25 +120,15 @@ def render(**kwargs: Any) -> ClickArgs | dict[str, Any]:
     elif config.renderer == RendererType.WEBGPU:
         from manim.renderer.webgpu.webgpu_renderer import WebGPURenderer
 
-        try:
-            renderer = WebGPURenderer()
-            keep_running = True
-            while keep_running:
-                for SceneClass in scene_classes_from_file(file):
-                    with tempconfig({}):
-                        scene = SceneClass(renderer)
-                        rerun = scene.render()
-                    if rerun or config["write_all"]:
-                        renderer.num_plays = 0
-                        continue
-                    else:
-                        keep_running = False
-                        break
-                if config["write_all"]:
-                    keep_running = False
-        except Exception:
-            error_console.print_exception()
-            sys.exit(1)
+        renderer = WebGPURenderer()
+        for SceneClass in scene_classes_from_file(file):
+            try:
+                with tempconfig({}):
+                    scene = SceneClass(renderer)
+                    scene.render()
+            except Exception:
+                error_console.print_exception()
+                sys.exit(1)
     else:
         for SceneClass in scene_classes_from_file(file):
             try:

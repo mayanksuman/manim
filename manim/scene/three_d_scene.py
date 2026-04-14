@@ -55,24 +55,30 @@ class ThreeDScene(Scene):
         )
         super().__init__(camera_class=camera_class, **kwargs)
 
-        # Default ambient light — exactly one is kept at all times.
-        # WebGPU renderer reads self.mobjects to find LightSource instances.
-        self._ambient_light = AmbientLight(intensity=0.5)
-        self.add(self._ambient_light)
+        if config.renderer == RendererType.WEBGPU:
+            # Default ambient light — exactly one is kept at all times.
+            # WebGPU renderer reads self.mobjects to find LightSource instances.
+            self._ambient_light = AmbientLight(intensity=0.5)
+            self.add(self._ambient_light)
 
     def add(self, *mobjects):
         """Override to enforce the single-ambient-light rule.
 
+        Every scene can have only one ambient light setting.
         If the caller adds a new :class:`~.AmbientLight`, the existing one is
         removed first so only one ambient light is ever in the scene.
         """
-        for mob in mobjects:
-            if isinstance(mob, AmbientLight):
-                # Remove any existing AmbientLight before adding the new one.
-                existing = [m for m in self.mobjects if isinstance(m, AmbientLight)]
-                for old in existing:
-                    super().remove(old)
-                self._ambient_light = mob
+        if config.renderer == RendererType.WEBGPU:
+            for mob in mobjects:
+                if isinstance(mob, AmbientLight):
+                    # Remove any existing AmbientLight before adding the new one.
+                    existing = [m for m in self.mobjects if isinstance(m, AmbientLight)]
+                    for old in existing:
+                        super().remove(old)
+                    self._ambient_light = mob
+        else:   # do not allow LightSource to be added for Cairo or OpenGL renderer
+            mobjects = [mob for mob in mobjects if not isinstance(mob, LightSource)]
+                
         return super().add(*mobjects)
 
     def set_camera_orientation(

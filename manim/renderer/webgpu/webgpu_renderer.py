@@ -21,6 +21,7 @@ to WebGPU NDC (x, y ∈ [-1, 1], z ∈ [0, 1]).
 
 from __future__ import annotations
 
+import collections
 import time
 import weakref
 from pathlib import Path
@@ -33,6 +34,7 @@ from manim import config, logger
 from manim.constants import IN, OUT, PI, RIGHT, DOWN, LEFT
 from manim.mobject.mobject import Mobject
 from manim.mobject.three_d.light_source import LightSource
+from manim.mobject.three_d.three_dimensions import Surface
 from manim.mobject.types.image_mobject import AbstractImageMobject, ImageMobjectFromCamera
 from manim.mobject.types.vectorized_mobject import VMobject
 from manim.scene.scene_file_writer import SceneFileWriter
@@ -741,9 +743,29 @@ class WebGPURenderer:
         self._readback_compute_bgl: wgpu_t.GPUBindGroupLayout | None = None
         self._readback_compute_bind_group: wgpu_t.GPUBindGroup | None = None
         # Storage buffer the compute shader writes into (STORAGE | COPY_SRC).
+        # One shared buffer — the compute shader always writes here first.
         self._readback_storage_buf: wgpu_t.GPUBuffer | None = None
-        # Mappable buffer we copy into before CPU readback (COPY_DST | MAP_READ).
-        self._readback_map_buf: wgpu_t.GPUBuffer | None = None
+
+        # ── Staging-buffer pool ──────────────────────────────────────────
+        # Instead of a single MAP_READ buffer we keep a ring of N buffers.
+        # update_frame() writes the readback into the next free slot and
+        # starts map_async immediately.  _get_mapped_frame_array() dequeues
+        # the oldest in-flight slot; by the time N frames have been submitted
+        # the GPU has had N frame-times to finish and sync_wait() returns
+        # instantly with no pipeline stall.
+        _READBACK_POOL = 3          # triple-buffering
+        self._READBACK_POOL: int = _READBACK_POOL
+        self._readback_pool: list[Any] = []        # GPUBuffer × _READBACK_POOL
+        # FIFO of slot indices submitted but not yet read.
+        self._readback_queue: collections.deque = collections.deque()
+        # Ring write pointer: next pool slot for update_frame to fill.
+        self._readback_write_slot: int = 0
+
+        # Cache the last successfully read pixel array.  Cleared by
+        # update_frame() so that get_image() / get_frame() hit the GPU path
+        # only once per rendered frame; repeated calls within the same frame
+        # are served from this cache without any GPU interaction.
+        self._readback_cache: np.ndarray | None = None
 
         # Per-frame state (set during update_frame, cleared after submit).
         self.current_render_pass: wgpu_t.GPURenderPassEncoder | None = None
@@ -815,7 +837,7 @@ class WebGPURenderer:
         height = config.pixel_height
         # bgra8unorm matches the window surface format on all major platforms
         # (Metal/Vulkan/DX12), enabling copy_texture_to_texture without a
-        # blit shader.  Readback in _get_raw_frame_data() swaps B↔R to
+        # blit shader.  Readback in _get_mapped_frame_array() swaps B↔R to
         # produce the RGBA output expected by PIL / numpy callers.
         self._render_texture = self._device.create_texture(
             size=(width, height, 1),
@@ -1629,18 +1651,16 @@ class WebGPURenderer:
     # ------------------------------------------------------------------
 
     def _collect_lights(self) -> list:
-        """Return all LightSource instances in the current scene (depth-first)."""
-        lights = []
+        """Return all LightSource instances in the current scene.
+
+        Lights are always added directly to the scene via ``self.add(light)``,
+        so scanning the top-level ``scene.mobjects`` list is sufficient and
+        avoids a deep O(N_submobjects) traversal through thousands of Surface
+        patches every frame.
+        """
         if self.scene is None:
-            return lights
-        def _walk(mob):
-            if isinstance(mob, LightSource):
-                lights.append(mob)
-            for child in mob.submobjects:
-                _walk(child)
-        for mob in self.scene.mobjects:
-            _walk(mob)
-        return lights
+            return []
+        return [m for m in self.scene.mobjects if isinstance(m, LightSource)]
 
     _MAX_LIGHTS = 8
 
@@ -2003,6 +2023,7 @@ class WebGPURenderer:
         scene: Scene,
         mob_list: list | None = None,
         blit_static: bool = False,
+        _readback: bool = True,
     ) -> None:
         """Render one frame into the offscreen texture.
 
@@ -2132,13 +2153,37 @@ class WebGPURenderer:
             if isinstance(mob, AbstractImageMobject):
                 _flush_runs()
                 render_queue.append(("image", mob))
+                # Recurse into submobjects (e.g. the display_frame SurroundingRectangle
+                # added by ImageMobjectFromCamera.add_display_frame()) so they are
+                # rendered as VMobject overlays on top of the image quad.
+                for sub in mob.submobjects:
+                    _walk(sub)
             elif isinstance(mob, DotCloud3D):
                 # WebGPU dot cloud — rendered as screen-aligned sphere quads.
                 _flush_runs()
                 render_queue.append(("truedot", mob))
-            elif isinstance(mob, VMobject):
+            elif isinstance(mob, Surface):
+                # Parametric Surface: add individually so collect_frame_data
+                # uses the Surface lighting/geometry cache path.
                 if mob in fixed_in_frame:
-                    pass  # handled in the overlay pass below
+                    pass  # handled in overlay pass below
+                elif mob in fixed_orient:
+                    _run_orient.append(mob)
+                else:
+                    _run_normal.append(mob)
+            elif isinstance(mob, VMobject):
+                # Container check: if any *direct* child is a Surface, Image, or
+                # DotCloud, recurse rather than treating this mob as a monolithic
+                # VMobject.  This ensures e.g. VGroup(Sphere(), Sphere()) routes
+                # each Sphere through the surface rendering path.
+                if mob.submobjects and any(
+                    isinstance(s, (Surface, AbstractImageMobject, DotCloud3D))
+                    for s in mob.submobjects
+                ):
+                    for sub in mob.submobjects:
+                        _walk(sub)
+                elif mob in fixed_in_frame:
+                    pass  # handled in overlay pass below
                 elif mob in fixed_orient:
                     _run_orient.append(mob)
                 else:
@@ -2482,7 +2527,58 @@ class WebGPURenderer:
                 self._fill_stroke_3d_pipeline = _saved_3d
             fixed_pass.end()
 
-        self._device.queue.submit([encoder.finish()])
+        # ── Invalidate readback cache ────────────────────────────────────
+        # A new frame is being rendered; cached pixel data from the previous
+        # frame is no longer valid.
+        self._readback_cache = None
+
+        # ── Pool-based pre-staged readback ───────────────────────────────
+        # Append the readback compute dispatch + buffer copy into the current
+        # pool slot, then call map_async immediately after submit.  The GPU
+        # processes the readback asynchronously while the CPU continues.
+        # When get_image() / get_frame() dequeues the slot, it calls
+        # sync_wait() — which returns instantly when the pool has been filled
+        # (the oldest slot has been in-flight for >= _READBACK_POOL frames).
+        #
+        # Guard: only pre-stage if the pool has a free slot.  A slot is free
+        # once it has been read (unmap called) by _get_mapped_frame_array.
+        # If all slots are still in-flight we skip pre-staging for this frame;
+        # _get_mapped_frame_array falls back to a fresh submit+map_sync.
+        #
+        # _readback=False skips readback staging entirely (used by
+        # save_static_frame_data, which renders for texture capture only and
+        # must not pollute the pool with non-movie frames).
+        if (
+            _readback
+            and self._readback_compute_pipeline is not None
+            and self._readback_compute_bind_group is not None
+            and self._readback_storage_buf is not None
+            and self._readback_pool
+            and len(self._readback_queue) < self._READBACK_POOL
+        ):
+            width  = config.pixel_width
+            height = config.pixel_height
+            packed_size = width * height * 4
+            slot = self._readback_write_slot
+
+            cp = encoder.begin_compute_pass()
+            cp.set_pipeline(self._readback_compute_pipeline)
+            cp.set_bind_group(0, self._readback_compute_bind_group)
+            cp.dispatch_workgroups((width + 15) // 16, (height + 15) // 16)
+            cp.end()
+
+            encoder.copy_buffer_to_buffer(
+                self._readback_storage_buf, 0,
+                self._readback_pool[slot],  0,
+                packed_size,
+            )
+
+            self._device.queue.submit([encoder.finish()])
+
+            self._readback_queue.append(slot)
+            self._readback_write_slot = (slot + 1) % self._READBACK_POOL
+        else:
+            self._device.queue.submit([encoder.finish()])
 
         # ── Sub-camera CPU readback ───────────────────────────────────────
         # Populate mob.camera.pixel_array from the staged sub-camera texture
@@ -2582,10 +2678,14 @@ class WebGPURenderer:
             size=packed_size,
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
         )
-        self._readback_map_buf = self._device.create_buffer(
-            size=packed_size,
-            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
-        )
+        # Allocate all pool slots up front — no per-frame allocation ever.
+        self._readback_pool = [
+            self._device.create_buffer(
+                size=packed_size,
+                usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+            )
+            for _ in range(self._READBACK_POOL)
+        ]
         self._readback_compute_bind_group = self._device.create_bind_group(
             layout=self._readback_compute_bgl,
             entries=[
@@ -2601,61 +2701,90 @@ class WebGPURenderer:
             ],
         )
 
-    def _get_raw_frame_data(self) -> bytes:
-        """Readback the current frame as tightly-packed RGBA bytes.
+    def _get_mapped_frame_array(self) -> np.ndarray:
+        """Return the current frame as a flat uint8 numpy array (H*W*4 elements).
 
-        A compute shader (readback_compact.wgsl) handles both row-depadding and
-        the bgra→rgba channel fix on the GPU.  The CPU no longer needs to loop
-        over rows or touch a numpy channel-swap.
+        Cache path (fastest): update_frame() has not been called since the last
+        readback, so the frame is unchanged — return the cached array directly
+        with zero GPU interaction.
+
+        Pool path: update_frame() enqueued a slot index into _readback_queue.
+        We dequeue the oldest slot and call map_sync().  When the pool has
+        been filled (_READBACK_POOL frames submitted before the first read),
+        the GPU work is already complete; map_sync() only pays the driver's
+        buffer-mapping overhead (< 1 ms) rather than a full GPU pipeline
+        stall.
+
+        Fallback path: nothing is in the queue (get_image called without a
+        preceding update_frame, or the pool was full at submit time).  We
+        submit fresh readback work to the next pool slot and block with
+        map_sync — same behaviour as before, but still using pool buffers so
+        no new GPU allocation occurs.
         """
         assert self._device is not None
         assert self._readback_compute_pipeline is not None
         assert self._readback_compute_bind_group is not None
         assert self._readback_storage_buf is not None
-        assert self._readback_map_buf is not None
+        assert self._readback_pool
+
+        # ── Cache hit ────────────────────────────────────────────────────
+        if self._readback_cache is not None:
+            return self._readback_cache
 
         width  = config.pixel_width
         height = config.pixel_height
         packed_size = width * height * 4
 
-        encoder = self._device.create_command_encoder()
+        if self._readback_queue:
+            # ── Pool path: dequeue oldest in-flight slot ─────────────────
+            # The slot was submitted >= _READBACK_POOL frames ago, so the GPU
+            # has had enough time to finish.  map_sync initiates the mapping
+            # and waits; since the GPU work is already done, only the driver's
+            # buffer-mapping overhead remains (typically < 1 ms).
+            slot = self._readback_queue.popleft()
+            buf  = self._readback_pool[slot]
+            buf.map_sync(wgpu.MapMode.READ)
+        else:
+            # ── Fallback path: submit now, block ─────────────────────────
+            slot = self._readback_write_slot
+            buf  = self._readback_pool[slot]
 
-        # Compact pass: row-depad + bgra→rgba in one GPU dispatch.
-        compute_pass = encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self._readback_compute_pipeline)
-        compute_pass.set_bind_group(0, self._readback_compute_bind_group)
-        compute_pass.dispatch_workgroups(
-            (width  + 15) // 16,
-            (height + 15) // 16,
-        )
-        compute_pass.end()
+            encoder = self._device.create_command_encoder()
 
-        # Copy packed storage buffer → mappable buffer.
-        encoder.copy_buffer_to_buffer(
-            self._readback_storage_buf, 0,
-            self._readback_map_buf,     0,
-            packed_size,
-        )
+            cp = encoder.begin_compute_pass()
+            cp.set_pipeline(self._readback_compute_pipeline)
+            cp.set_bind_group(0, self._readback_compute_bind_group)
+            cp.dispatch_workgroups((width + 15) // 16, (height + 15) // 16)
+            cp.end()
 
-        self._device.queue.submit([encoder.finish()])
+            encoder.copy_buffer_to_buffer(
+                self._readback_storage_buf, 0,
+                buf,                         0,
+                packed_size,
+            )
 
-        self._readback_map_buf.map_sync(wgpu.MapMode.READ)
-        raw = bytes(self._readback_map_buf.read_mapped())
-        self._readback_map_buf.unmap()
-        return raw
+            self._device.queue.submit([encoder.finish()])
+            buf.map_sync(wgpu.MapMode.READ)
+            self._readback_write_slot = (slot + 1) % self._READBACK_POOL
+
+        # numpy copy is ~3× faster than bytes() for large buffers (SIMD path).
+        arr = np.frombuffer(buf.read_mapped(), dtype=np.uint8).copy()
+        buf.unmap()
+
+        self._readback_cache = arr
+        return arr
 
     def get_image(self) -> Image.Image:
         """Return the current frame as a PIL Image (RGBA)."""
-        raw = self._get_raw_frame_data()
-        return Image.frombytes(
-            "RGBA", (config.pixel_width, config.pixel_height), raw
+        arr = self._get_mapped_frame_array()
+        return Image.fromarray(
+            arr.reshape(config.pixel_height, config.pixel_width, 4), "RGBA"
         )
 
     def get_frame(self) -> np.ndarray:
         """Return the current frame as a (height, width, 4) uint8 NumPy array."""
-        raw = self._get_raw_frame_data()
-        return np.frombuffer(raw, dtype=np.uint8).reshape(
-            (config.pixel_height, config.pixel_width, 4)
+        return self._get_mapped_frame_array().reshape(
+            config.pixel_height, config.pixel_width, 4
         )
 
     # ------------------------------------------------------------------
@@ -2742,9 +2871,13 @@ class WebGPURenderer:
             return
         self.file_writer.write_frame(self)
         if self.window is not None:
+            if self.window.is_closing:
+                self.window = None
+                return
             self.window.present()
             while self.animation_elapsed_time < frame_offset:
                 if self.window.is_closing:
+                    self.window = None
                     break
                 if self._has_static_frame:
                     self.update_frame(scene, mob_list=list(moving_mobjects), blit_static=True)
@@ -2796,11 +2929,15 @@ class WebGPURenderer:
                     self, num_frames=int(config.frame_rate * scene.duration)
                 )
             if self.window is not None:
-                self.window.present()
-                while time.time() - self.animation_start_time < scene.duration:
-                    if self.window.is_closing:
-                        break
+                if self.window.is_closing:
+                    self.window = None
+                else:
                     self.window.present()
+                    while time.time() - self.animation_start_time < scene.duration:
+                        if self.window.is_closing:
+                            self.window = None
+                            break
+                        self.window.present()
             self.animation_elapsed_time = scene.duration
         else:
             scene.play_internal()
@@ -2820,6 +2957,18 @@ class WebGPURenderer:
             config.save_last_frame = True
             self.update_frame(scene)
             self.file_writer.save_image(self.get_image())
+
+        # Explicitly close the preview window so that GlfwRenderCanvas._rc_close()
+        # destroys the GLFW window handle while GLFW is still alive.  Without this,
+        # Python shutdown calls GlfwCanvasGroup.__del__ → glfw.terminate() first,
+        # then the GlfwRenderCanvas.__del__ fires and tries glfw.destroy_window()
+        # on an already-terminated GLFW library, producing a GLFWError warning.
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
 
     def save_static_frame_data(self, scene: Scene, static_mobjects: Any) -> None:
         """Render *static_mobjects* once and cache the result in ``_static_texture``.
@@ -2843,10 +2992,23 @@ class WebGPURenderer:
             self._static_mob_ids = set()
             return
 
+        # If the camera itself is animated (e.g. begin_ambient_camera_rotation),
+        # any pre-rendered static texture is stale on the very next frame because
+        # the projection changes.  Disable the optimisation so every frame is
+        # fully re-rendered with the correct camera orientation.
+        if self.camera.has_time_based_updater():
+            self._has_static_frame = False
+            self._static_mob_ids = set()
+            return
+
         self._static_mob_ids = set(id(m) for m in static_list)
 
         # Render the static mob list into _render_texture (full clear + draw).
-        self.update_frame(scene, mob_list=static_list, blit_static=False)
+        # _readback=False: this render is for texture capture only — it must not
+        # enqueue a readback pool slot, because save_static_frame_data is not
+        # writing a movie frame and a stale slot in the pool would cause the next
+        # write_frame() call to read wrong pixel data.
+        self.update_frame(scene, mob_list=static_list, blit_static=False, _readback=False)
 
         # Copy _render_texture → _static_texture for later per-frame blits.
         encoder = self._device.create_command_encoder()
